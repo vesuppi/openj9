@@ -105,6 +105,13 @@
 #include "j9port.h"
 #include "ras/DebugExt.hpp"
 #include "env/exports.h"
+#if defined(JITSERVER_SUPPORT)
+#include "net/CommunicationStream.hpp" 
+#include "net/ClientStream.hpp"
+#include "runtime/JITClientSession.hpp"
+#include "runtime/Listener.hpp"
+#include "runtime/JITServerStatisticsThread.hpp"
+#endif
 
 extern "C" int32_t encodeCount(int32_t count);
 
@@ -198,6 +205,13 @@ char *compilationErrorNames[]={
    "compilationSymbolValidationManagerFailure", //50
    "compilationAOTNoSupportForAOTFailure", //51
    "compilationAOTValidateTMFailure", //52
+#if defined(JITSERVER_SUPPORT)
+   "compilationStreamFailure", //53
+   "compilationStreamLostMessage", // 54
+   "compilationStreamMessageTypeMismatch", // 55
+   "compilationStreamVersionIncompatible", // 56
+   "compilationStreamInterrupted", // 57
+#endif /* defined(JITSERVER_SUPPORT) */
    "compilationMaxError"
 };
 
@@ -1411,7 +1425,7 @@ onLoadInternal(
       }
    if (!TR_DataCacheManager::initialize(jitConfig))
       {
-      printf("{JIT: fatal error, failed to allocate %d Kb data cache}\n", jitConfig->dataCacheKB);
+      printf("{JIT: fatal error, failed to allocate %lu Kb data cache}\n", jitConfig->dataCacheKB);
       return -1;
       }
 
@@ -1581,6 +1595,45 @@ onLoadInternal(
             TR::Options::getCmdLineOptions()->getOption(TR_InhibitRecompilation)))
          persistentMemory->getPersistentInfo()->setRuntimeInstrumentationRecompilationEnabled(true);
       }
+#if defined(JITSERVER_SUPPORT)
+   if (compInfo->getPersistentInfo()->getRemoteCompilationMode() == JITServer::SERVER)
+      {
+      JITServer::CommunicationStream::initVersion();
+
+      // Allocate the hashtable that holds information about clients
+      compInfo->setClientSessionHT(ClientSessionHT::allocate());
+
+      ((TR_JitPrivateConfig*)(jitConfig->privateConfig))->listener = TR_Listener::allocate();
+      if (!((TR_JitPrivateConfig*)(jitConfig->privateConfig))->listener)
+         {
+         // warn that Listener was not allocated
+         j9tty_printf(PORTLIB, "JITServer Listener not allocated, abort.\n");
+         return -1;
+         }
+      if (jitConfig->samplingFrequency != 0)
+         {
+         ((TR_JitPrivateConfig*)(jitConfig->privateConfig))->statisticsThreadObject = JITServerStatisticsThread::allocate();
+         if (!((TR_JitPrivateConfig*)(jitConfig->privateConfig))->statisticsThreadObject)
+            {
+            // warn that Statistics Thread was not allocated
+            j9tty_printf(PORTLIB, "JITServer Statistics thread not allocated, abort.\n");
+            return -1;
+            }
+         }
+      else
+         {
+         ((TR_JitPrivateConfig*)(jitConfig->privateConfig))->statisticsThreadObject = NULL;
+         }
+      }
+   else if (compInfo->getPersistentInfo()->getRemoteCompilationMode() == JITServer::CLIENT)
+      {
+      // Try to initialize SSL
+      if (JITServer::ClientStream::static_init(compInfo->getPersistentInfo()) != 0)
+         return -1;
+
+      JITServer::CommunicationStream::initVersion();
+      }
+#endif // JITSERVER_SUPPORT
 
 #if defined(TR_HOST_S390)
    if (TR::Compiler->om.readBarrierType() != gc_modron_readbar_none)
@@ -1799,12 +1852,7 @@ aboutToBootstrap(J9JavaVM * javaVM, J9JITConfig * jitConfig)
       hwProfiler->turnBufferProcessingOffTemporarily();
       }
 
-   /* Register this module with trace */
-#if defined(UT_DIRECT_TRACE_REGISTRATION)
    UT_MODULE_LOADED(J9_UTINTERFACE_FROM_VM(javaVM));
-#else
-   UT_MODULE_LOADED(javaVM);
-#endif
    Trc_JIT_VMInitStages_Event1(curThread);
 
    return 0;

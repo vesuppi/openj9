@@ -449,12 +449,12 @@ void J9FASTCALL _jitProfileAddress(uintptr_t value, TR_LinkedListProfilerInfo<ui
 
 extern "C" {
 
-void J9FASTCALL _jProfile32BitValue(uint32_t value, TR_HashTableProfilerInfo<uint32_t> *table)
+void J9FASTCALL jProfile32BitValue(uint32_t value, TR_HashTableProfilerInfo<uint32_t> *table)
    {
    table->addKey(value);
    }
 
-void J9FASTCALL _jProfile64BitValue(uint64_t value, TR_HashTableProfilerInfo<uint64_t> *table)
+void J9FASTCALL jProfile64BitValue(uint64_t value, TR_HashTableProfilerInfo<uint64_t> *table)
    {
    table->addKey(value);
    }
@@ -551,7 +551,8 @@ void J9FASTCALL _jitProfileBigDecimalValue(uintptr_t value, uintptr_t bigdecimal
    bool readValues = false;
    if (value)
       {
-      if ((((J9Object *) value)->clazz & (UDATA)(-J9_REQUIRED_CLASS_ALIGNMENT)) == ((j9objectclass_t) bigdecimalj9class))
+	  uintptr_t objectClass = TR::Compiler->om.compressObjectReferences() ? ((J9ObjectCompressed*)value)->clazz : ((J9ObjectFull*)value)->clazz;
+      if ((objectClass & (UDATA)(-J9_REQUIRED_CLASS_ALIGNMENT)) == bigdecimalj9class)
          {
          readValues = true;
          scale = *((int32_t *) (value + scaleOffset));
@@ -1157,7 +1158,11 @@ JIT_HELPER(_jitProfileStringValueX);
 JIT_HELPER(_jitProfileAddressX);
 JIT_HELPER(_induceRecompilation);
 
+#endif
 
+#if defined(TR_HOST_X86) && defined(TR_HOST_64BIT)
+JIT_HELPER(jProfile32BitValueWrapper);
+JIT_HELPER(jProfile64BitValueWrapper);
 #endif
 
 
@@ -1177,8 +1182,8 @@ void initializeJitRuntimeHelperTable(char isSMP)
    SET(TR_jitProfileBigDecimalValue,            (void *)_jitProfileBigDecimalValueWrap,   TR_Helper);
    SET(TR_jitProfileStringValue,                (void *)_jitProfileStringValueWrap,       TR_Helper);
    SET(TR_jitProfileParseBuffer,                (void *)_jitProfileParseBuffer,           TR_Helper);
-   SET_CONST(TR_jProfile32BitValue,             (void *)_jProfile32BitValue);
-   SET_CONST(TR_jProfile64BitValue,             (void *)_jProfile64BitValue);
+   SET_CONST(TR_jProfile32BitValue,             (void *)jProfile32BitValue);
+   SET_CONST(TR_jProfile64BitValue,             (void *)jProfile64BitValue);
 #elif defined(TR_HOST_X86)
    SET(TR_jitProfileWarmCompilePICAddress,      (void *)_jitProfileWarmCompilePICAddress, TR_CHelper);
    SET(TR_jitProfileAddress,                    (void *)_jitProfileAddress,               TR_CHelper);
@@ -1187,8 +1192,13 @@ void initializeJitRuntimeHelperTable(char isSMP)
    SET(TR_jitProfileBigDecimalValue,            (void *)_jitProfileBigDecimalValue,       TR_CHelper);
    SET(TR_jitProfileStringValue,                (void *)_jitProfileStringValue,           TR_CHelper);
    SET(TR_jitProfileParseBuffer,                (void *)_jitProfileParseBuffer,           TR_CHelper);
-   SET(TR_jProfile32BitValue,                   (void *)_jProfile32BitValue,              TR_CHelper);
-   SET(TR_jProfile64BitValue,                   (void *)_jProfile64BitValue,              TR_CHelper);
+#if defined(TR_HOST_64BIT)
+   SET(TR_jProfile32BitValue,                   (void *)jProfile32BitValueWrapper,        TR_CHelper);
+   SET(TR_jProfile64BitValue,                   (void *)jProfile64BitValueWrapper,        TR_CHelper);
+#else
+   SET(TR_jProfile32BitValue,                   (void *)jProfile32BitValue,        TR_CHelper);
+   SET(TR_jProfile64BitValue,                   (void *)jProfile64BitValue,        TR_CHelper);
+#endif
 #else
    SET(TR_jitProfileWarmCompilePICAddress,      (void *)_jitProfileWarmCompilePICAddress, TR_Helper);
    SET(TR_jitProfileAddress,                    (void *)_jitProfileAddress,               TR_Helper);
@@ -1197,8 +1207,8 @@ void initializeJitRuntimeHelperTable(char isSMP)
    SET(TR_jitProfileBigDecimalValue,            (void *)_jitProfileBigDecimalValue,       TR_Helper);
    SET(TR_jitProfileStringValue,                (void *)_jitProfileStringValue,           TR_Helper);
    SET(TR_jitProfileParseBuffer,                (void *)_jitProfileParseBuffer,           TR_Helper);
-   SET(TR_jProfile32BitValue,                   (void *)_jProfile32BitValue,              TR_Helper);
-   SET(TR_jProfile64BitValue,                   (void *)_jProfile64BitValue,              TR_Helper);
+   SET(TR_jProfile32BitValue,                   (void *)jProfile32BitValue,              TR_Helper);
+   SET(TR_jProfile64BitValue,                   (void *)jProfile64BitValue,              TR_Helper);
 #endif
 
 #if defined(J9ZOS390)
@@ -1329,13 +1339,23 @@ uint32_t isRecompMethBody(void *li)
 
 // This method MUST be used only for methods that were AOTed and then relocated
 // It marks the BodyInfo that this is an aoted method.
-void fixPersistentMethodInfo(void *table)
+void fixPersistentMethodInfo(void *table, bool isJITClientAOTLoad)
    {
    J9JITExceptionTable *exceptionTable = (J9JITExceptionTable *)table;
    TR_PersistentJittedBodyInfo *bodyInfo = (TR_PersistentJittedBodyInfo *)exceptionTable->bodyInfo;
    void *vmMethodInfo = (void *)exceptionTable->ramMethod;
-   TR_PersistentMethodInfo *methodInfo = (TR_PersistentMethodInfo *)((char *)bodyInfo + sizeof(TR_PersistentJittedBodyInfo));
-   bodyInfo->setMethodInfo(methodInfo);
+   TR_PersistentMethodInfo *methodInfo;
+
+   if (!isJITClientAOTLoad)
+      {
+      methodInfo = (TR_PersistentMethodInfo *)((char *)bodyInfo + sizeof(TR_PersistentJittedBodyInfo));
+      bodyInfo->setMethodInfo(methodInfo);
+      }
+   else
+      {
+      methodInfo = bodyInfo->getMethodInfo();
+      }
+
    methodInfo->setMethodInfo(vmMethodInfo);
 
    if (TR::Options::getCmdLineOptions()->getOption(TR_EnableHCR))
@@ -1348,7 +1368,11 @@ void fixPersistentMethodInfo(void *table)
    bodyInfo->setHotStartCountDelta(0);
    bodyInfo->setSampleIntervalCount(0);
    bodyInfo->setProfileInfo(NULL);
-   bodyInfo->setIsAotedBody(true);
+
+   if (!isJITClientAOTLoad)
+      {
+      bodyInfo->setIsAotedBody(true);
+      }
    }
 #endif
 

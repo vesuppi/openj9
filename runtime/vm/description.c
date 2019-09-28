@@ -71,6 +71,7 @@ calculateInstanceDescription( J9VMThread *vmThread, J9Class *ramClass, J9Class *
 	UDATA *shape;
 
 	J9UTF8 *className = J9ROMCLASS_CLASSNAME(ramClass->romClass);
+	BOOLEAN shouldSaveSelfReferencingFields = J9_ARE_ALL_BITS_SET(vmThread->javaVM->extendedRuntimeFlags2, J9_EXTENDED_RUNTIME2_ENABLE_DEEPSCAN);
 
 #ifdef J9VM_GC_LEAF_BITS
 	UDATA leafTemp;
@@ -145,6 +146,11 @@ calculateInstanceDescription( J9VMThread *vmThread, J9Class *ramClass, J9Class *
 #endif
 			}
 		}
+
+		/* If there are self referencing field offsets being inherited then self referencing fields of this class should be ignored.*/
+		if (shouldSaveSelfReferencingFields) {
+			shouldSaveSelfReferencingFields = (ramSuperClass->selfReferencingField1 == 0);
+		}
 	}
 
 	/* calculate the description for this class - walk object instance fields and 
@@ -157,12 +163,16 @@ calculateInstanceDescription( J9VMThread *vmThread, J9Class *ramClass, J9Class *
 			U_8 *fieldSigBytes = J9UTF8_DATA(fieldSig);
 			U_16 fieldSigLength = J9UTF8_LENGTH(fieldSig);
 
-			/* If the field is self referencing then store the offset to it (at most 2). Self referencing fields are to be scanned with priority during GC */
-			if (((ramClass->selfReferencingField1 == 0) || (ramClass->selfReferencingField2 == 0)) && J9UTF8_DATA_EQUALS(J9UTF8_DATA(className), J9UTF8_LENGTH(className), fieldSigBytes + 1, fieldSigLength - 2)) {
-				if (ramClass->selfReferencingField1 == 0) {
-					ramClass->selfReferencingField1 = walkResult->offset + objectHeaderSize;
-				} else {
-					ramClass->selfReferencingField2 = walkResult->offset + objectHeaderSize;
+			/* If the field is self referencing then store the offset to it (at most 2). Self referencing fields
+			 * are to be scanned with priority during GC. Both self referencing fields must be from the same class.
+			 */
+			if (shouldSaveSelfReferencingFields && ((ramClass->selfReferencingField1 == 0) || (ramClass->selfReferencingField2 == 0))) {
+				if (J9UTF8_DATA_EQUALS(J9UTF8_DATA(className), J9UTF8_LENGTH(className), fieldSigBytes + 1, fieldSigLength - 2)) {
+					if (ramClass->selfReferencingField1 == 0) {
+						ramClass->selfReferencingField1 = walkResult->offset + objectHeaderSize;
+					} else {
+						ramClass->selfReferencingField2 = walkResult->offset + objectHeaderSize;
+					}
 				}
 			}
 

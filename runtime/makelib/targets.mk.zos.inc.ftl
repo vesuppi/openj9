@@ -70,7 +70,7 @@ endif
 
 UMA_ZOS_FLAGS += -DJ9ZOS390 -DLONGLONG -DJ9VM_TIERED_CODE_CACHE -D_ALL_SOURCE -D_XOPEN_SOURCE_EXTENDED -DIBM_ATOE -D_POSIX_SOURCE
 UMA_ZOS_FLAGS += -I$(OMR_DIR)/util/a2e/headers $(UMA_OPTIMIZATION_FLAGS) $(UMA_OPTIMIZATION_LINKER_FLAGS) \
-	-Wc,"xplink,convlit(ISO8859-1),rostring,FLOAT(IEEE,FOLD,AFP),enum(4)" -Wa,goff -Wc,NOANSIALIAS -Wc,"inline(auto,noreport,600,5000)"
+	-Wc,"convlit(ISO8859-1),xplink,rostring,FLOAT(IEEE,FOLD,AFP),enum(4)" -Wa,goff -Wc,NOANSIALIAS -Wc,"inline(auto,noreport,600,5000)"
 UMA_ZOS_FLAGS += -Wc,"SERVICE(j${uma.buildinfo.build_date})" -Wc,"TARGET(zOSV1R13)"
 UMA_ZOS_FLAGS += -Wc,list,offset
 ifdef j9vm_env_data64
@@ -100,16 +100,12 @@ ifdef j9vm_jit_freeSystemStackPointer
   UMA_M4_FLAGS += -DJ9VM_JIT_FREE_SYSTEM_STACK_POINTER
 endif
 
-# Static libraries that are included in a shared library require the
-# EXPORTALL option in order to export their symbols (e.g. JNI). This applies to zOS only.
-# The change is not made globally as it will export undesired symbols. Additional
-# target names may be added as needed.
+COMMA := ,
 
-ifeq ($(UMA_TARGET_NAME),jvmti_test_agent)
-  UMA_ZOS_FLAGS += -Wc,DLL,EXPORTALL
-endif
-ifeq ($(UMA_TARGET_NAME),jvmti_test_src)
-  UMA_ZOS_FLAGS += -Wc,DLL,EXPORTALL
+# Compile jniargtestssystemlink with non-XPLINK (system) linkage
+ifeq ($(UMA_TARGET_NAME),jniargtestssystemlink)
+  UMA_ZOS_FLAGS := $(subst $(COMMA)xplink,,$(UMA_ZOS_FLAGS))
+  UMA_LINK_FLAGS := $(subst $(COMMA)xplink,,$(UMA_LINK_FLAGS))
 endif
 
 ifndef j9vm_env_data64
@@ -136,7 +132,6 @@ endif
 
 # JAZZ103 49015 - compile with MRABIG debug option to reduce stack size required for -Xmt
 MRABIG = -Wc,"TBYDBG(-qdebug=MRABIG)"
-COMMA := ,
 SPECIALCXXFLAGS = $(filter-out -Wc$(COMMA)debug -O3,$(CXXFLAGS))
 NEW_OPTIMIZATION_FLAG = -O2 -Wc,"TBYDBG(-qdebug=lincomm:ptranl:tfbagg)" -Wc,"FEDBG(-qxflag=InlineDespiteVolatileInArgs)"
 BytecodeInterpreter.o : BytecodeInterpreter.cpp

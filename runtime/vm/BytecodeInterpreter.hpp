@@ -1028,13 +1028,38 @@ obj:;
 	 * @returns the new object, or NULL if allocation failed
 	 */
 	VMINLINE j9object_t
-	allocateObject(REGISTER_ARGS_LIST, J9Class *clazz, bool initializeSlots = true, bool memoryBarrier = true)
+	allocateObject(REGISTER_ARGS_LIST, J9Class *clazz, bool initializeSlots = true, bool memoryBarrier = true, bool skipUnflattenedFlattenableCheck = false)
 	{
-		j9object_t instance = _objectAllocate.inlineAllocateObject(_currentThread, clazz, initializeSlots, memoryBarrier);
+		j9object_t instance = NULL;
+#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
+		if (skipUnflattenedFlattenableCheck || J9_ARE_NO_BITS_SET(clazz->classFlags, J9ClassContainsUnflattenedFlattenables))
+#endif /* J9VM_OPT_VALHALLA_VALUE_TYPES */
+		{
+			instance = _objectAllocate.inlineAllocateObject(_currentThread, clazz, initializeSlots, memoryBarrier);
+		}
 		if (NULL == instance) {
 			updateVMStruct(REGISTER_ARGS);
 			instance = _vm->memoryManagerFunctions->J9AllocateObject(_currentThread, clazz, J9_GC_ALLOCATE_OBJECT_NON_INSTRUMENTABLE);
 			VMStructHasBeenUpdated(REGISTER_ARGS);
+		}
+		return instance;
+	}
+
+	/* Allocate an array instance
+	 * 
+	 * @returns the allocated array instance
+	 */
+	VMINLINE j9object_t
+	inlineArrayAllocation(J9Class *arrayClass, U_32 size, bool initializeSlots = true, bool memoryBarrier = true, bool sizeCheck = true)
+	{
+		j9object_t instance = NULL;
+#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
+		if (J9_IS_J9CLASS_FLATTENED(arrayClass)) {
+			instance = _objectAllocate.inlineAllocateIndexableValueTypeObject(_currentThread, arrayClass, size, initializeSlots, memoryBarrier, sizeCheck);
+		} else
+#endif /* J9VM_OPT_VALHALLA_VALUE_TYPES */
+		{
+			instance = _objectAllocate.inlineAllocateIndexableObject(_currentThread, arrayClass, size, initializeSlots, memoryBarrier, sizeCheck);
 		}
 		return instance;
 	}
@@ -1056,14 +1081,11 @@ obj:;
 	allocateIndexableObject(REGISTER_ARGS_LIST, J9Class *arrayClass, U_32 size, bool initializeSlots = true, bool memoryBarrier = true, bool sizeCheck = true)
 	{
 		j9object_t instance = NULL;
-
 #if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
-		if (J9_IS_J9CLASS_FLATTENED(arrayClass)) {
-			instance = _objectAllocate.inlineAllocateIndexableValueTypeObject(_currentThread, arrayClass, (U_32)size, initializeSlots, memoryBarrier, sizeCheck);
-		} else
-#endif /* defined(J9VM_OPT_VALHALLA_VALUE_TYPES) */
+		if (J9_ARE_NO_BITS_SET(arrayClass->classFlags, J9ClassContainsUnflattenedFlattenables)) 
+#endif
 		{
-			instance = _objectAllocate.inlineAllocateIndexableObject(_currentThread, arrayClass, (U_32)size, initializeSlots, memoryBarrier, sizeCheck);
+			instance = inlineArrayAllocation(arrayClass, size, initializeSlots, memoryBarrier, sizeCheck);
 		}
 
 		if (NULL == instance) {
@@ -3106,14 +3128,7 @@ done:
 		if (flags & J9AccClassArray) {
 			U_32 size = J9INDEXABLEOBJECT_SIZE(_currentThread, original);
 
-#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
-			if (J9_IS_J9CLASS_FLATTENED(objectClass)) {
-				copy = _objectAllocate.inlineAllocateIndexableValueTypeObject(_currentThread, objectClass, size, false, false, false);
-			} else
-#endif /* defined(J9VM_OPT_VALHALLA_VALUE_TYPES) */
-			{
-				copy = _objectAllocate.inlineAllocateIndexableObject(_currentThread, objectClass, size, false, false, false);
-			}
+			copy = inlineArrayAllocation(objectClass, size, false, false, false);
 
 			if (NULL == copy) {
 				pushObjectInSpecialFrame(REGISTER_ARGS, original);
@@ -3711,7 +3726,7 @@ done:
 	inlUnsafePutObject(REGISTER_ARGS_LIST, bool isVolatile)
 	{
 		VM_BytecodeAction rc = EXECUTE_BYTECODE;
-		j9object_t value = *(j9object_t*)_sp;
+		j9object_t *value = (j9object_t*)_sp;
 		UDATA offset = (UDATA)*(I_64*)(_sp + 1);
 		j9object_t obj = *(j9object_t*)(_sp + 3);
 		
@@ -3833,8 +3848,8 @@ done:
 	inlUnsafeCompareAndSwapObject(REGISTER_ARGS_LIST)
 	{
 		VM_BytecodeAction rc = EXECUTE_BYTECODE;
-		j9object_t swapValue = *(j9object_t*)_sp;
-		j9object_t compareValue = *(j9object_t*)(_sp + 1);
+		j9object_t *swapValue = (j9object_t*)_sp;
+		j9object_t *compareValue = (j9object_t*)(_sp + 1);
 		UDATA offset = (UDATA)*(I_64*)(_sp + 2);
 		j9object_t obj = *(j9object_t*)(_sp + 4);
 
@@ -4120,6 +4135,12 @@ done:
 			goto done;
 		}
 		_vm->anonClassLoader->flags |= J9CLASSLOADER_ANON_CLASS_LOADER;
+		if (NULL != _vm->sharedClassConfig) {
+			if (J9_ARE_ANY_BITS_SET(_vm->sharedClassConfig->runtimeFlags, J9SHR_RUNTIMEFLAG_ENABLE_SHAREANONYMOUSCLASSES)) {
+				/* ShareAnonymousClasses is enabled by default so we set the class loader flag */
+				_vm->anonClassLoader->flags |= J9CLASSLOADER_SHARED_CLASSES_ENABLED;
+			}
+		}
 		J9CLASSLOADER_SET_CLASSLOADEROBJECT(_currentThread, _vm->anonClassLoader, anonClassLoaderObject);
 		VM_AtomicSupport::writeBarrier();
 		J9VMJAVALANGCLASSLOADER_SET_VMREF(_currentThread, anonClassLoaderObject, _vm->anonClassLoader);
@@ -5802,7 +5823,34 @@ done:
 				_currentThread->tempSlot = (UDATA)index;
 				rc = THROW_AIOB;
 			} else {
-				j9object_t value = _objectAccessBarrier.inlineIndexableObjectReadObject(_currentThread, arrayref, index);
+				j9object_t value = NULL;
+#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
+				J9Class *arrayrefClass = J9OBJECT_CLAZZ(_currentThread, arrayref);
+				if (J9_IS_J9CLASS_FLATTENED(arrayrefClass)) {
+					j9object_t newObjectRef = _objectAllocate.inlineAllocateObject(_currentThread, ((J9ArrayClass*)arrayrefClass)->leafComponentType, false, false);
+
+					if (NULL == newObjectRef) {
+						buildGenericSpecialStackFrame(REGISTER_ARGS, 0);
+						pushObjectInSpecialFrame(REGISTER_ARGS, arrayref);
+						updateVMStruct(REGISTER_ARGS);
+						newObjectRef = _vm->memoryManagerFunctions->J9AllocateObject(_currentThread, ((J9ArrayClass*)arrayrefClass)->leafComponentType, J9_GC_ALLOCATE_OBJECT_NON_INSTRUMENTABLE);
+						VMStructHasBeenUpdated(REGISTER_ARGS);
+						arrayref = popObjectInSpecialFrame(REGISTER_ARGS);
+						restoreGenericSpecialStackFrame(REGISTER_ARGS);
+						if (J9_UNEXPECTED(NULL == newObjectRef)) {
+							rc = THROW_HEAP_OOM;
+							return rc;
+						}
+						arrayrefClass = VM_VMHelpers::currentClass(arrayrefClass);
+					}
+
+					_objectAccessBarrier.copyObjectFieldsFromArrayElement(_currentThread, arrayrefClass, newObjectRef, (J9IndexableObject *) arrayref, index);
+					value = newObjectRef;
+				} else
+#endif /* if defined(J9VM_OPT_VALHALLA_VALUE_TYPES) */
+				{
+					value = _objectAccessBarrier.inlineIndexableObjectReadObject(_currentThread, arrayref, index);
+				}
 				_pc += 1;
 				_sp += 1;
 				*(j9object_t*)_sp = value;
@@ -5834,7 +5882,15 @@ done:
 				if (false == objectArrayStoreAllowed(arrayref, value)) {
 					rc = THROW_ARRAY_STORE;
 				} else {
-					_objectAccessBarrier.inlineIndexableObjectStoreObject(_currentThread, arrayref, index, value);
+#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
+					J9Class *arrayrefClass = J9OBJECT_CLAZZ(_currentThread, arrayref);
+					if (J9_IS_J9CLASS_FLATTENED(arrayrefClass)) {
+						_objectAccessBarrier.copyObjectFieldsToArrayElement(_currentThread, arrayrefClass, value, (J9IndexableObject *) arrayref, index);
+					} else 
+#endif /* if defined(J9VM_OPT_VALHALLA_VALUE_TYPES) */
+					{
+						_objectAccessBarrier.inlineIndexableObjectStoreObject(_currentThread, arrayref, index, value);
+					}
 					_pc += 1;
 					_sp += 3;
 				}
@@ -6336,15 +6392,15 @@ resolve:
 			/* Put resolved for a non-final field means fully resolved */
 			if (J9_UNEXPECTED(resolvedBit != bits)) {
 				/* If not put resolved for a final field, resolve is necessary */
-				if (testBits != bits) {
+				if (J9_UNEXPECTED(testBits != bits)) {
 					goto resolve;
 				}
 				/* Final field - ensure the running method is allowed to store */
-				if (J9_UNEXPECTED(VM_VMHelpers::ramClassChecksFinalStores(ramConstantPool->ramClass)
-					          && !VM_VMHelpers::romMethodIsInitializer(J9_ROM_METHOD_FROM_RAM_METHOD(_literals), true)
-				)) {
-					/* Store not allowed - run the resolve code to throw the exception */
-					goto resolve;
+				if (J9_UNEXPECTED(!J9ROMMETHOD_ALLOW_FINAL_FIELD_WRITES(J9_ROM_METHOD_FROM_RAM_METHOD(_literals), J9AccStatic))) {
+					if (J9_UNEXPECTED(VM_VMHelpers::ramClassChecksFinalStores(ramConstantPool->ramClass))) {
+						/* Store not allowed - run the resolve code to throw the exception */
+						goto resolve;
+					}
 				}
 			}
 		}
@@ -6546,15 +6602,15 @@ resolve:
 			/* Put resolved for a non-final field means fully resolved */
 			if (J9_UNEXPECTED(resolvedBit != bits)) {
 				/* If not put resolved for a final field, resolve is necessary */
-				if (testBits != bits) {
+				if (J9_UNEXPECTED(testBits != bits)) {
 					goto resolve;
 				}
 				/* Final field - ensure the running method is allowed to store */
-				if (J9_UNEXPECTED(VM_VMHelpers::ramClassChecksFinalStores(ramConstantPool->ramClass)
-					          && !VM_VMHelpers::romMethodIsInitializer(J9_ROM_METHOD_FROM_RAM_METHOD(_literals), true)
-				)) {
-					/* Store not allowed - run the resolve code to throw the exception */
-					goto resolve;
+				if (J9_UNEXPECTED(!J9ROMMETHOD_ALLOW_FINAL_FIELD_WRITES(J9_ROM_METHOD_FROM_RAM_METHOD(_literals), 0))) {
+					if (J9_UNEXPECTED(VM_VMHelpers::ramClassChecksFinalStores(ramConstantPool->ramClass))) {
+						/* Store not allowed - run the resolve code to throw the exception */
+						goto resolve;
+					}
 				}
 			}
 		}
@@ -7371,7 +7427,13 @@ retry:
 		J9Class* volatile resolvedClass = ramCPEntry->value;
 		if ((NULL != resolvedClass) && J9ROMCLASS_ALLOCATES_VIA_NEW(resolvedClass->romClass)) {
 			if (!VM_VMHelpers::classRequiresInitialization(_currentThread, resolvedClass)) {
-				j9object_t instance = _objectAllocate.inlineAllocateObject(_currentThread, resolvedClass);
+				j9object_t instance = NULL;
+#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
+				if (J9_ARE_NO_BITS_SET(resolvedClass->classFlags, J9ClassContainsUnflattenedFlattenables))
+#endif /* J9VM_OPT_VALHALLA_VALUE_TYPES */
+				{
+					instance = _objectAllocate.inlineAllocateObject(_currentThread, resolvedClass);
+				}
 				if (NULL == instance) {
 					updateVMStruct(REGISTER_ARGS);
 					instance = _vm->memoryManagerFunctions->J9AllocateObject(_currentThread, resolvedClass, J9_GC_ALLOCATE_OBJECT_INSTRUMENTABLE);
@@ -7492,12 +7554,10 @@ retry:
 			if (J9_EXPECTED(NULL != arrayClass)) {
 				j9object_t instance = NULL;
 #if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
-				if (J9_IS_J9CLASS_FLATTENED(arrayClass)) {
-					instance = _objectAllocate.inlineAllocateIndexableValueTypeObject(_currentThread, arrayClass, (U_32)size);
-				} else
-#endif /* J9VM_OPT_VALHALLA_VALUE_TYPES */
+				if (J9_ARE_NO_BITS_SET(arrayClass->classFlags, J9ClassContainsUnflattenedFlattenables)) 
+#endif
 				{
-					instance = _objectAllocate.inlineAllocateIndexableObject(_currentThread, arrayClass, (U_32)size);
+					instance = inlineArrayAllocation(arrayClass, (U_32) size);
 				}
 
 				if (NULL == instance) {
@@ -8291,7 +8351,10 @@ retry:
 		J9Class * volatile resolvedClass = ramCPEntry->value;
 
 		if ((NULL != resolvedClass) && J9_IS_J9CLASS_VALUETYPE(resolvedClass) && !VM_VMHelpers::classRequiresInitialization(_currentThread, resolvedClass)) {
-			j9object_t instance = _objectAllocate.inlineAllocateObject(_currentThread, resolvedClass);
+			j9object_t instance = NULL;
+			if (J9_ARE_NO_BITS_SET(resolvedClass->classFlags, J9ClassContainsUnflattenedFlattenables)) {
+				instance = _objectAllocate.inlineAllocateObject(_currentThread, resolvedClass);
+			}
 			if (NULL == instance) {
 				updateVMStruct(REGISTER_ARGS);
 				instance = _vm->memoryManagerFunctions->J9AllocateObject(_currentThread, resolvedClass, J9_GC_ALLOCATE_OBJECT_INSTRUMENTABLE);

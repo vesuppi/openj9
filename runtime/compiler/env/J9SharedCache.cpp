@@ -99,11 +99,19 @@ TR_J9SharedCache::TR_J9SharedCache(TR_J9VMBase *fe)
    _compInfo = TR::CompilationInfo::get(_jitConfig);
    _aotStats = fe->getPrivateConfig()->aotStats;
    _sharedCacheConfig = _javaVM->sharedClassConfig;
-   _cacheStartAddress = (UDATA) _sharedCacheConfig->cacheDescriptorList->cacheStartAddress;
-   _cacheSizeInBytes = _sharedCacheConfig->cacheDescriptorList->cacheSizeBytes;
-   _numDigitsForCacheOffsets=8;
-   if (_cacheSizeInBytes > (UDATA)0xFFFFFFFF)
-      _numDigitsForCacheOffsets=16;
+   _numDigitsForCacheOffsets = 8;
+
+   UDATA totalCacheSize = 0;
+   J9SharedClassCacheDescriptor *curCache = _sharedCacheConfig->cacheDescriptorList;
+   do
+      {
+      totalCacheSize += curCache->cacheSizeBytes;
+      curCache = curCache->next;
+      }
+   while (curCache != _sharedCacheConfig->cacheDescriptorList);
+
+   if (totalCacheSize > UINT_MAX)
+      _numDigitsForCacheOffsets = 16;
 
    _hintsEnabledMask = 0;
    if (!TR::Options::getAOTCmdLineOptions()->getOption(TR_DisableSharedCacheHints))
@@ -113,15 +121,12 @@ TR_J9SharedCache::TR_J9SharedCache(TR_J9VMBase *fe)
    if (_initialHintSCount == 0)
       _initialHintSCount = 1;
 
-
    _logLevel = std::max(TR::Options::getAOTCmdLineOptions()->getAotrtDebugLevel(), TR::Options::getCmdLineOptions()->getAotrtDebugLevel());
 
    _verboseHints = TR::Options::getCmdLineOptions()->getVerboseOption(TR_VerboseSCHints);
 
    LOG(5, { log("\t_sharedCacheConfig %p\n", _sharedCacheConfig); });
-   LOG(5, { log("\t_cacheStartAddress %p\n", _cacheStartAddress); });
-   LOG(5, { log("\t_cacheSizeInBytes %p\n", _cacheSizeInBytes); });
-   LOG(5, { log("\tlast cache address %p\n", _cacheStartAddress + _cacheSizeInBytes); });
+   LOG(5, { log("\ttotalCacheSize %p\n", totalCacheSize); });
    }
 
 void
@@ -140,7 +145,6 @@ TR_J9SharedCache::log(char *format, ...)
    JITRT_PRINTF(jitConfig())(jitConfig(), "%s", outputBuffer);
    JITRT_UNLOCK_LOG(jitConfig());
    }
-
 
 uint32_t
 TR_J9SharedCache::getHint(J9VMThread * vmThread, J9Method *method)
@@ -254,20 +258,20 @@ TR_J9SharedCache::addHint(J9Method * method, TR_SharedCacheHint theHint)
       uint16_t *hintFlags = (uint16_t *)&scHintData;
       uint16_t *hintCount = ((uint16_t *)&scHintData) + 1; // Flags and new count field needs to be in contiguous location to be stored into sharecache
 
-      bool hintDidNotExist = ((newHint & *hintFlags) == 0);
-      const uint32_t scHintDataLength = 4;
+      const uint32_t scHintDataLength = sizeof(scHintData);
 
-      if (hintDidNotExist)
+      if (scHintData == 0) // If no prior hints exist, we can perform a "storeAttachedData" operation
          {
          uint32_t bytesToPersist = 0;
 
          if (!SCfull)
             {
+            *hintFlags |= newHint;
             if (isFailedValidationHint)
                *hintCount = 10 * _initialHintSCount;
 
             J9SharedDataDescriptor descriptor;
-            descriptor.address = (U_8 *)(uintptrj_t)scHintData;
+            descriptor.address = (U_8*)hintFlags;
             descriptor.length = scHintDataLength; // Size includes the 2nd data field, currently only used for TR_HintFailedValidation
             descriptor.type = J9SHR_ATTACHED_DATA_TYPE_JITHINT;
             descriptor.flags = J9SHR_ATTACHED_DATA_NO_FLAGS;
@@ -303,27 +307,43 @@ TR_J9SharedCache::addHint(J9Method * method, TR_SharedCacheHint theHint)
             _compInfo->increaseUnstoredBytes(0, bytesToPersist);
             }
          }
-      else
+      else // Some hints already exist for this method. We must perform an "updateAttachedData"
          {
-         bool updateHint = true;
-         if (isFailedValidationHint)
+         bool updateHint = false;
+         bool hintDidNotExist = ((newHint & *hintFlags) == 0);
+         if (hintDidNotExist)
             {
-            uint16_t oldCount = *hintCount;
-            uint16_t newCount = std::min(oldCount * 10, TR_DEFAULT_INITIAL_COUNT);
-            if (newCount == oldCount)
+            updateHint = true;
+            *hintFlags |= newHint;
+            if (isFailedValidationHint)
+               *hintCount = 10 * _initialHintSCount;
+            }
+         else
+            {
+            // hint already exists, but maybe we need to update the count
+            if (isFailedValidationHint)
                {
-               updateHint = false;
-               if (_verboseHints)
+               uint16_t oldCount = *hintCount;
+               uint16_t newCount = std::min(oldCount * 10, TR_DEFAULT_INITIAL_COUNT);
+
+               if (newCount != oldCount)
                   {
-                  TR_VerboseLog::writeLineLocked(TR_Vlog_SCHINTS,"hint reached max count of %d", oldCount);
+                  updateHint = true;
+                  *hintCount = newCount;
+                  }
+               else
+                  {
+                  if (_verboseHints)
+                     {
+                     TR_VerboseLog::writeLineLocked(TR_Vlog_SCHINTS, "hint reached max count of %d", oldCount);
+                     }
                   }
                }
             }
-
          if (updateHint)
             {
             J9SharedDataDescriptor descriptor;
-            descriptor.address = (U_8 *)(uintptrj_t)scHintData;
+            descriptor.address = (U_8*)hintFlags;
             descriptor.length = scHintDataLength; // Size includes the 2nd data field, currently only used for TR_HintFailedValidation
             descriptor.type = J9SHR_ATTACHED_DATA_TYPE_JITHINT;
             descriptor.flags = J9SHR_ATTACHED_DATA_NO_FLAGS;
@@ -353,6 +373,7 @@ TR_J9SharedCache::addHint(TR_ResolvedMethod * method, TR_SharedCacheHint hint)
    addHint(((TR_ResolvedJ9Method *) method)->ramMethod(), hint);
    }
 
+
 void
 TR_J9SharedCache::persistIprofileInfo(TR::ResolvedMethodSymbol *methodSymbol, TR::Compilation *comp)
    {
@@ -374,51 +395,92 @@ TR_J9SharedCache::isMostlyFull()
    return (double) sharedCacheConfig()->getFreeSpaceBytes(_javaVM) / sharedCacheConfig()->getCacheSizeBytes(_javaVM) < 0.8;
    }
 
-J9Class *
-TR_J9SharedCache::matchRAMclassFromROMclass(J9ROMClass * clazz, TR::Compilation * comp)
+bool
+TR_J9SharedCache::isPointerInCache(const J9SharedClassCacheDescriptor *cacheDesc, void *ptr)
    {
-   TR_J9VMBase *fej9 = (TR_J9VMBase *)(fe());
-   J9VMThread *vmThread = fej9->getCurrentVMThread();
-   J9UTF8 *className = J9ROMCLASS_CLASSNAME(clazz);
-   J9Class *ramClass = NULL;
+   uintptr_t ptrValue = (uintptr_t)ptr;
+   uintptr_t cacheStart = (uintptr_t)cacheDesc->cacheStartAddress; // Inclusive
+   uintptr_t cacheEnd = cacheStart + cacheDesc->cacheSizeBytes; // Exclusive
+   return (ptrValue >= cacheStart) && (ptrValue < cacheEnd);
+   }
 
+void *
+TR_J9SharedCache::pointerFromOffsetInSharedCache(uintptr_t offset)
+   {
+#if defined(J9VM_OPT_MULTI_LAYER_SHARED_CLASS_CACHE)
+   // The cache descriptor list is linked last to first and is circular, so last->previous == first.
+   J9SharedClassCacheDescriptor *firstCache = _sharedCacheConfig->cacheDescriptorList->previous;
+   J9SharedClassCacheDescriptor *curCache = firstCache;
+   do
       {
-      TR::VMAccessCriticalSection matchRAMclassFromROMclass(fej9);
-      ramClass = jitGetClassInClassloaderFromUTF8(vmThread,
-                                                  ((TR_ResolvedJ9Method *)comp->getCurrentMethod())->getClassLoader(),
-                                                  (char *) J9UTF8_DATA(className),
-                                                  J9UTF8_LENGTH(className));
-      if (!ramClass)
+      if (offset < curCache->cacheSizeBytes)
          {
-         ramClass = jitGetClassInClassloaderFromUTF8(vmThread, (J9ClassLoader *) javaVM()->systemClassLoader,
-            (char *) J9UTF8_DATA(className), J9UTF8_LENGTH(className));
+         return (void *)(offset + (uintptr_t)curCache->cacheStartAddress);
          }
+      offset -= curCache->cacheSizeBytes;
+      curCache = curCache->previous;
       }
+   while (curCache != firstCache);
+#else // !J9VM_OPT_MULTI_LAYER_SHARED_CLASS_CACHE
+   J9SharedClassCacheDescriptor *curCache = _sharedCacheConfig->cacheDescriptorList;
+   if (offset < curCache->cacheSizeBytes)
+      {
+      return (void *)(offset + (uintptr_t)curCache->cacheStartAddress);
+      }
+#endif // J9VM_OPT_MULTI_LAYER_SHARED_CLASS_CACHE
 
-   return ramClass;
+   TR_ASSERT_FATAL(false, "Shared cache offset out of bounds");
+   return NULL;
    }
 
-void *
-TR_J9SharedCache::pointerFromOffsetInSharedCache(void *offset)
-   {
-   return (void *) ((UDATA)offset + _cacheStartAddress);
-   }
-
-void *
+uintptr_t
 TR_J9SharedCache::offsetInSharedCacheFromPointer(void *ptr)
    {
-   return (void *) ((UDATA)ptr - _cacheStartAddress);
+   uintptr_t offset = 0;
+   if (isPointerInSharedCache(ptr, &offset))
+      {
+      return offset;
+      }
+   TR_ASSERT_FATAL(false, "Shared cache pointer out of bounds");
+   return offset;
    }
 
 bool
-TR_J9SharedCache::isPointerInSharedCache(void *ptr, void * & cacheOffset)
+TR_J9SharedCache::isPointerInSharedCache(void *ptr, uintptrj_t *cacheOffset)
    {
-   UDATA offset = (UDATA) offsetInSharedCacheFromPointer(ptr);
-   if (offset < _cacheSizeInBytes)
+#if defined(J9VM_OPT_MULTI_LAYER_SHARED_CLASS_CACHE)
+   uintptr_t offset = 0;
+   // The cache descriptor list is linked last to first and is circular, so last->previous == first.
+   J9SharedClassCacheDescriptor *firstCache = _sharedCacheConfig->cacheDescriptorList->previous;
+   J9SharedClassCacheDescriptor *curCache = firstCache;
+   do
       {
-      cacheOffset = (void*)offset;
+      if (isPointerInCache(curCache, ptr))
+         {
+         if (cacheOffset)
+            {
+            uintptr_t cacheStart = (uintptr_t)curCache->cacheStartAddress;
+            *cacheOffset = (uintptr_t)ptr - cacheStart + offset;
+            }
+         return true;
+         }
+      offset += curCache->cacheSizeBytes;
+      curCache = curCache->previous;
+      }
+   while (curCache != firstCache);
+#else // !J9VM_OPT_MULTI_LAYER_SHARED_CLASS_CACHE
+   J9SharedClassCacheDescriptor *curCache = _sharedCacheConfig->cacheDescriptorList;
+   if (isPointerInCache(curCache, ptr))
+      {
+      if (cacheOffset)
+         {
+         uintptr_t cacheStart = (uintptr_t)curCache->cacheStartAddress;
+         *cacheOffset = (uintptr_t)ptr - cacheStart;
+         }
       return true;
       }
+#endif // J9VM_OPT_MULTI_LAYER_SHARED_CLASS_CACHE
+
    return false;
    }
 
@@ -428,7 +490,7 @@ TR_J9SharedCache::startingROMClassOfClassChain(UDATA *classChain)
    UDATA lengthInBytes = classChain[0];
    TR_ASSERT_FATAL(lengthInBytes >= 2 * sizeof (UDATA), "class chain is too short!");
 
-   void *romClassOffset = reinterpret_cast<void*>(classChain[1]);
+   UDATA romClassOffset = classChain[1];
    void *romClass = pointerFromOffsetInSharedCache(romClassOffset);
    return static_cast<J9ROMClass*>(romClass);
    }
@@ -460,8 +522,8 @@ TR_J9SharedCache::rememberClass(J9Class *clazz, bool create)
    J9UTF8 * className = J9ROMCLASS_CLASSNAME(clazz->romClass);
    LOG(5,{ log("rememberClass class %p %.*s\n", clazz, J9UTF8_LENGTH(className), J9UTF8_DATA(className)); });
 
-   void * classOffsetInCache;
-   if (! isPointerInSharedCache(clazz->romClass, classOffsetInCache))
+   uintptrj_t classOffsetInCache;
+   if (!isPointerInSharedCache(clazz->romClass, &classOffsetInCache))
       {
       LOG(5,{ log("\trom class not in shared cache, returning\n"); });
       return NULL;
@@ -469,7 +531,7 @@ TR_J9SharedCache::rememberClass(J9Class *clazz, bool create)
 
    char key[17]; // longest possible key length is way less than 16 digits
    uint32_t keyLength;
-   createClassKey((UDATA)classOffsetInCache, key, keyLength);
+   createClassKey(classOffsetInCache, key, keyLength);
 
    LOG(9, { log("\tkey created: %.*s\n", keyLength, key); });
 
@@ -555,7 +617,7 @@ TR_J9SharedCache::rememberDebugCounterName(const char *name)
                                         0,
                                         &dataDescriptor);
 
-   UDATA offset = data ? (UDATA)offsetInSharedCacheFromPointer((void *)data) : (UDATA)-1;
+   UDATA offset = data ? offsetInSharedCacheFromPointer((void *)data) : (UDATA)-1;
 
    //printf("\nrememberDebugCounterName: Tried to store %s (%p), data=%p, offset=%p\n", name, name, data, offset);
 
@@ -565,7 +627,7 @@ TR_J9SharedCache::rememberDebugCounterName(const char *name)
 const char *
 TR_J9SharedCache::getDebugCounterName(UDATA offset)
    {
-   const char *name = (offset != (UDATA)-1) ? (const char *)pointerFromOffsetInSharedCache((void *)offset) : NULL;
+   const char *name = (offset != (UDATA)-1) ? (const char *)pointerFromOffsetInSharedCache(offset) : NULL;
 
    //printf("\ngetDebugCounterName: Tried to find %p, name=%s (%p)\n", offset, (name ? name : ""), name);
 
@@ -588,8 +650,8 @@ TR_J9SharedCache::numInterfacesImplemented(J9Class *clazz)
 bool
 TR_J9SharedCache::writeClassToChain(J9ROMClass *romClass, UDATA * & chainPtr)
    {
-   void *classOffsetInCache;
-   if (!isPointerInSharedCache(romClass, classOffsetInCache))
+   uintptrj_t classOffsetInCache;
+   if (!isPointerInSharedCache(romClass, &classOffsetInCache))
       {
       LOG(9, { log("\t\tromclass %p not in shared cache, writeClassToChain returning false\n", romClass); });
       return false;
@@ -597,7 +659,7 @@ TR_J9SharedCache::writeClassToChain(J9ROMClass *romClass, UDATA * & chainPtr)
 
    J9UTF8 * className = J9ROMCLASS_CLASSNAME(romClass);
    LOG(9, {log("\t\tChain %p storing romclass %p (%.*s) offset %d\n", chainPtr, romClass, J9UTF8_LENGTH(className), J9UTF8_DATA(className), classOffsetInCache); });
-   *chainPtr++ = (UDATA) classOffsetInCache;
+   *chainPtr++ = classOffsetInCache;
    return true;
    }
 
@@ -661,8 +723,11 @@ bool
 TR_J9SharedCache::romclassMatchesCachedVersion(J9ROMClass *romClass, UDATA * & chainPtr, UDATA *chainEnd)
    {
    J9UTF8 * className = J9ROMCLASS_CLASSNAME(romClass);
-   LOG(9, { log("\t\tExamining romclass %p (%.*s) offset %d, comparing to %d\n", romClass, J9UTF8_LENGTH(className), J9UTF8_DATA(className), (UDATA)romClass - _cacheStartAddress, *chainPtr); });
-   if (chainPtr > chainEnd || ((UDATA)romClass - _cacheStartAddress) != *chainPtr++)
+   UDATA romClassOffset;
+   if (!isPointerInSharedCache(romClass, &romClassOffset))
+      return false;
+   LOG(9, { log("\t\tExamining romclass %p (%.*s) offset %d, comparing to %d\n", romClass, J9UTF8_LENGTH(className), J9UTF8_DATA(className), romClassOffset, *chainPtr); });
+   if ((chainPtr > chainEnd) || (romClassOffset != *chainPtr++))
       return false;
    return true;
    }
@@ -693,8 +758,8 @@ TR_J9SharedCache::classMatchesCachedVersion(J9Class *clazz, UDATA *chainData)
    J9UTF8 * className = J9ROMCLASS_CLASSNAME(clazz->romClass);
    LOG(5, { log("classMatchesCachedVersion class %p %.*s\n", clazz, J9UTF8_LENGTH(className), J9UTF8_DATA(className)); });
 
-   void *classOffsetInCache;
-   if (! isPointerInSharedCache(clazz->romClass, classOffsetInCache))
+   uintptrj_t classOffsetInCache;
+   if (!isPointerInSharedCache(clazz->romClass, &classOffsetInCache))
       {
       LOG(5, { log("\tclass not in shared cache, returning false\n"); });
       return false;
@@ -704,7 +769,7 @@ TR_J9SharedCache::classMatchesCachedVersion(J9Class *clazz, UDATA *chainData)
       {
       char key[17]; // longest possible key length is way less than 16 digits
       uint32_t keyLength;
-      createClassKey((UDATA)classOffsetInCache, key, keyLength);
+      createClassKey(classOffsetInCache, key, keyLength);
       LOG(9, { log("\tno chain specific, so looking up for key %.*s\n", keyLength, key); });
       chainData = findChainForClass(clazz, key, keyLength);
       if (chainData == NULL)
@@ -761,7 +826,7 @@ TR_OpaqueClassBlock *
 TR_J9SharedCache::lookupClassFromChainAndLoader(uintptrj_t *chainData, void *classLoader)
    {
    UDATA *ptrToRomClassOffset = chainData+1;
-   J9ROMClass *romClass = (J9ROMClass *)(_cacheStartAddress + *ptrToRomClassOffset);
+   J9ROMClass *romClass = (J9ROMClass *)pointerFromOffsetInSharedCache(*ptrToRomClassOffset);
    J9UTF8 *className = J9ROMCLASS_CLASSNAME(romClass);
    TR_J9VMBase *fej9 = (TR_J9VMBase *)(fe());
    J9VMThread *vmThread = fej9->getCurrentVMThread();
@@ -780,6 +845,6 @@ TR_J9SharedCache::getClassChainOffsetOfIdentifyingLoaderForClazzInSharedCache(TR
    {
    void *loaderForClazz = _fe->getClassLoader(clazz);
    void *classChainIdentifyingLoaderForClazz = persistentClassLoaderTable()->lookupClassChainAssociatedWithClassLoader(loaderForClazz);
-   uintptrj_t classChainOffsetInSharedCache = (uintptrj_t) offsetInSharedCacheFromPointer(classChainIdentifyingLoaderForClazz);
+   uintptrj_t classChainOffsetInSharedCache = offsetInSharedCacheFromPointer(classChainIdentifyingLoaderForClazz);
    return classChainOffsetInSharedCache;
    }

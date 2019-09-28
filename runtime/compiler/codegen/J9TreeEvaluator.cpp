@@ -734,9 +734,15 @@ uint32_t J9::TreeEvaluator::calculateInstanceOfOrCheckCastSequences(TR::Node *in
 
    TR::SymbolReference *castClassSymRef = castClassNode->getSymbolReference();
 
+   if (cg->comp()->getOption(TR_OptimizeForSpace) || (cg->comp()->getOption(TR_DisableInlineCheckCast) && (instanceOfOrCheckCastNode->getOpCodeValue() == TR::checkcast || instanceOfOrCheckCastNode->getOpCodeValue() == TR::checkcastAndNULLCHK)) || (cg->comp()->getOption(TR_DisableInlineInstanceOf) && instanceOfOrCheckCastNode->getOpCodeValue() == TR::instanceof))
+      {
+      if (instanceOfOrCheckCastNode->getOpCodeValue() == TR::checkcastAndNULLCHK)
+         sequences[i++] = NullTest;
+      sequences[i++] = HelperCall;  
+      }
    // Object is known to be null, usually removed by the optimizer, but in case they're not we know the result of the cast/instanceof.
    //
-   if (objectNode->isNull())
+   else if (objectNode->isNull())
       {
       if (instanceOfOrCheckCastNode->getOpCodeValue() == TR::checkcastAndNULLCHK)
             sequences[i++] = NullTest;
@@ -785,7 +791,7 @@ uint32_t J9::TreeEvaluator::calculateInstanceOfOrCheckCastSequences(TR::Node *in
 
       TR::StaticSymbol   *castClassSym = castClassSymRef->getSymbol()->getStaticSymbol();
       TR_OpaqueClassBlock *castClass = (TR_OpaqueClassBlock *)castClassSym->getStaticAddress();
-      J9UTF8              *castClassName = J9ROMCLASS_CLASSNAME(((J9Class *)castClass)->romClass);
+      J9UTF8              *castClassName = J9ROMCLASS_CLASSNAME(TR::Compiler->cls.romClassOf((TR_OpaqueClassBlock *) castClass));
       // Cast class is a primitive (implies this is an instanceof, since you can't cast an object to a primitive).
       // Usually removed by the optimizer, but in case they're not we know they'll always fail, no object can be of a primitive type.
       // We don't even need to do a null test unless it's a checkcastAndNULLCHK node.
@@ -834,7 +840,7 @@ uint32_t J9::TreeEvaluator::calculateInstanceOfOrCheckCastSequences(TR::Node *in
                {
                for (int i=0; i<numProfiledClasses; i++)
                   {
-                  J9UTF8 *profiledClassName = J9ROMCLASS_CLASSNAME(((J9Class *)profiledClassList[i].profiledClass)->romClass);
+                  J9UTF8 *profiledClassName = J9ROMCLASS_CLASSNAME(TR::Compiler->cls.romClassOf((TR_OpaqueClassBlock *) profiledClassList[i].profiledClass));
                   traceMsg(cg->comp(), "%s:Interpreter profiling instance class: [" POINTER_PRINTF_FORMAT "] %.*s, probability=%.1f\n",
                      instanceOfOrCheckCastNode->getOpCode().getName(), profiledClassList[i].profiledClass, J9UTF8_LENGTH(profiledClassName), J9UTF8_DATA(profiledClassName), profiledClassList[i].frequency);
                   }
@@ -858,7 +864,7 @@ uint32_t J9::TreeEvaluator::calculateInstanceOfOrCheckCastSequences(TR::Node *in
                   {
                   if (singleImplementerClass)
                      {
-                     J9UTF8 *singleImplementerClassName = J9ROMCLASS_CLASSNAME(((J9Class *)singleImplementerClass)->romClass);
+                     J9UTF8 *singleImplementerClassName = J9ROMCLASS_CLASSNAME(TR::Compiler->cls.romClassOf((TR_OpaqueClassBlock *) singleImplementerClass));
                      traceMsg(cg->comp(), "%s: Single implementer for interface/abstract class: [" POINTER_PRINTF_FORMAT "] %.*s\n",
                               instanceOfOrCheckCastNode->getOpCode().getName(), singleImplementerClass, J9UTF8_LENGTH(singleImplementerClassName), J9UTF8_DATA(singleImplementerClassName));
                      }

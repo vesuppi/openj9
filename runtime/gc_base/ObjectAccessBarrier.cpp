@@ -39,7 +39,7 @@
 #include "VMThreadListIterator.hpp"
 #include "ModronAssertions.h"
 #include "VMHelpers.hpp"
-
+#include "ObjectAccessBarrierAPI.hpp"
 
 
 bool 
@@ -1108,6 +1108,43 @@ MM_ObjectAccessBarrier::indexableStoreI64(J9VMThread *vmThread, J9IndexableObjec
 }
 
 /**
+ * Copy object fields into flattened array element
+ *
+ * @param vmThread thread token
+ * @param arrayClazz array J9Class
+ * @param srcObject object whose fields will be copied
+ * @param arrayRef array object
+ * @param index index of array element where fields are copied to
+ */
+void
+MM_ObjectAccessBarrier::copyObjectFieldsToArrayElement(J9VMThread *vmThread, J9Class *arrayClazz, j9object_t srcObject, J9IndexableObject *arrayRef, I_32 index)
+{
+	UDATA const objectHeaderSize = J9VMTHREAD_OBJECT_HEADER_SIZE(vmThread);
+	U_8 *elementAddress = (U_8*)indexableEffectiveAddress(vmThread, arrayRef, index, J9ARRAYCLASS_GET_STRIDE(arrayClazz));
+	IDATA elementOffset = (elementAddress - (U_8*)arrayRef);
+	copyObjectFields(vmThread, J9GC_J9OBJECT_CLAZZ_THREAD(srcObject, vmThread), srcObject, objectHeaderSize, (j9object_t) arrayRef, elementOffset);
+}
+
+/**
+ * Copy object fields into flattened array element
+ *
+ * @param vmThread thread token
+ * @param arrayClazz array J9Class
+ * @param destObject object where array element fields will be copied to
+ * @param arrayRef array object
+ * @param index index of array element where fields are copied to
+ */
+void
+MM_ObjectAccessBarrier::copyObjectFieldsFromArrayElement(J9VMThread *vmThread, J9Class *arrayClazz, j9object_t destObject, J9IndexableObject *arrayRef, I_32 index)
+{
+	UDATA const objectHeaderSize = J9VMTHREAD_OBJECT_HEADER_SIZE(vmThread);
+	U_8 *elementAddress = (U_8*)indexableEffectiveAddress(vmThread, arrayRef, index, J9ARRAYCLASS_GET_STRIDE(arrayClazz));
+	IDATA elementOffset = (elementAddress - (U_8*)arrayRef);
+	copyObjectFields(vmThread, J9GC_J9OBJECT_CLAZZ_THREAD(destObject, vmThread), (j9object_t) arrayRef, elementOffset, destObject, objectHeaderSize);
+}
+
+
+/**
  * Read a static field.
  * @param srcSlot The static field slot.
  * @param isVolatile non-zero if the field is volatile.
@@ -1297,29 +1334,29 @@ MM_ObjectAccessBarrier::staticStoreI64(J9VMThread *vmThread, J9Class *clazz, I_6
  U_8 *
 MM_ObjectAccessBarrier::getArrayObjectDataAddress(J9VMThread *vmThread, J9IndexableObject *arrayObject)
 {
-#if defined(J9VM_GC_ARRAYLETS)
 	 if (_extensions->indexableObjectModel.isInlineContiguousArraylet(arrayObject)) {
 		 return (U_8 *)_extensions->indexableObjectModel.getDataPointerForContiguous(arrayObject);
 	 } else {
 		 return (U_8 *)_extensions->indexableObjectModel.getArrayoidPointer(arrayObject);
 	 }
-#else
-	 return (U_8 *)_extensions->indexableObjectModel.getDataPointerForContiguous(arrayObject);
-#endif /* J9VM_GC_ARRAYLETS */
 }
 
 /**
  * Return the address of the lockword for the given object, or NULL if it 
  * does not have an inline lockword.
  */
- j9objectmonitor_t *
+j9objectmonitor_t *
 MM_ObjectAccessBarrier::getLockwordAddress(J9VMThread *vmThread, J9Object *object)
 {
-	UDATA lockOffset = J9OBJECT_CLAZZ(vmThread, object)->lockOffset;
-	if ((IDATA) lockOffset < 0) {
-		return NULL;	
+	j9objectmonitor_t *lockwordAddress = NULL;
+	J9Class *clazz = J9OBJECT_CLAZZ(vmThread, object);
+	if (!J9_IS_J9CLASS_VALUETYPE(clazz)) {
+		UDATA lockOffset = clazz->lockOffset;
+		if ((IDATA) lockOffset >= 0) {
+			lockwordAddress = (j9objectmonitor_t *)(((U_8 *)object) + lockOffset);
+		}
 	}
-	return (j9objectmonitor_t *)(((U_8 *)object) + lockOffset);
+	return lockwordAddress;
 }
 
 /**
@@ -1423,9 +1460,9 @@ MM_ObjectAccessBarrier::copyObjectFields(J9VMThread *vmThread, J9Class *objectCl
 		lockwordAddress = getLockwordAddress(vmThread, destObject);
 		if (NULL != lockwordAddress) {
 			if (J9_ARE_ANY_BITS_SET(J9CLASS_EXTENDED_FLAGS(objectClass), J9ClassReservableLockWordInit)) {
-				*lockwordAddress = OBJECT_HEADER_LOCK_RESERVED;
+				J9_STORE_LOCKWORD(vmThread, lockwordAddress, OBJECT_HEADER_LOCK_RESERVED);
 			} else {
-				*lockwordAddress = 0;
+				J9_STORE_LOCKWORD(vmThread, lockwordAddress, 0);
 			}
 		}
 	}
@@ -1460,7 +1497,7 @@ MM_ObjectAccessBarrier::cloneIndexableObject(J9VMThread *vmThread, J9IndexableOb
 	/* zero lockword, if present */
 	lockwordAddress = getLockwordAddress(vmThread, (J9Object*) destObject);
 	if (NULL != lockwordAddress) {
-		*lockwordAddress = 0;
+		J9_STORE_LOCKWORD(vmThread, lockwordAddress, OBJECT_HEADER_LOCK_RESERVED);
 	}
 
 	return;
@@ -1974,8 +2011,6 @@ MM_ObjectAccessBarrier::compressedPointersShadowHeapTop(J9VMThread *vmThread)
 	return 0;
 }
 
-
-#if defined(J9VM_GC_ARRAYLETS)
 /**
  * @return this cannot fail (overloaded can) => returns ARRAY_COPY_NOT_DONE
  */
@@ -2012,7 +2047,6 @@ MM_ObjectAccessBarrier::doCopyContiguousForward(J9VMThread *vmThread, J9Indexabl
 	
 	return ARRAY_COPY_SUCCESSFUL;	
 }
-#endif /* J9VM_GC_ARRAYLETS */
 
 I_32
 MM_ObjectAccessBarrier::getObjectHashCode(J9JavaVM *vm, J9Object *object)

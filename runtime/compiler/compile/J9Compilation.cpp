@@ -52,6 +52,7 @@
 #include "optimizer/TransformUtil.hpp"
 #include "runtime/RuntimeAssumptions.hpp"
 #include "runtime/J9Profiler.hpp"
+#include "OMR/Bytes.hpp"
 
 #include "j9.h"
 #include "j9cfg.h"
@@ -65,6 +66,8 @@
  */
 bool firstCompileStarted = false;
 
+// JITSERVER_TODO: disabled to allow for JITServer
+#if !defined(JITSERVER_SUPPORT)
 void *operator new(size_t size)
    {
 #if defined(DEBUG)
@@ -89,6 +92,7 @@ void operator delete(void *)
    {
    TR_ASSERT(0, "Invalid use of global operator delete");
    }
+#endif /* !defined(JITSERVER_SUPPORT) */
 
 
 
@@ -170,6 +174,10 @@ J9::Compilation::Compilation(int32_t id,
    _profileInfo(NULL),
    _skippedJProfilingBlock(false),
    _reloRuntime(reloRuntime),
+#if defined(JITSERVER_SUPPORT)
+   _outOfProcessCompilation(false),
+   _remoteCompilation(false),
+#endif /* defined(JITSERVER_SUPPORT) */
    _osrProhibitedOverRangeOfTrees(false)
    {
    _symbolValidationManager = new (self()->region()) TR::SymbolValidationManager(self()->region(), compilee);
@@ -535,15 +543,9 @@ J9::Compilation::canAllocateInlineOnStack(TR::Node* node, TR_OpaqueClassBlock* &
          return -1;
 
       // Can not inline the allocation on stack if the class is special
-      if (clazz->classDepthAndFlags & (J9AccClassReferenceWeak      |
-                                       J9AccClassReferenceSoft      |
-                                       J9AccClassFinalizeNeeded            |
-                                       J9AccClassOwnableSynchronizer))
-         {
+      if (TR::Compiler->cls.isClassSpecialForStackAllocation((TR_OpaqueClassBlock *)clazz))
          return -1;
-         }
       }
-
    return self()->canAllocateInline(node, classInfo);
    }
 
@@ -554,17 +556,7 @@ J9::Compilation::canAllocateInlineClass(TR_OpaqueClassBlock *block)
    if (block == NULL)
       return false;
 
-   J9Class* clazz = reinterpret_cast<J9Class*> (block);
-
-   // Can not inline the allocation if the class is not fully initialized
-   if (clazz->initializeStatus != 1)
-      return false;
-
-   // Can not inline the allocation if the class is an interface or abstract
-   if (clazz->romClass->modifiers & (J9AccAbstract | J9AccInterface))
-      return false;
-
-   return true;
+   return self()->fej9()->canAllocateInlineClass(block);
    }
 
 
@@ -622,8 +614,7 @@ J9::Compilation::canAllocateInline(TR::Node* node, TR_OpaqueClassBlock* &classIn
       TR_ASSERT(node->getSecondChild()->getOpCode().isLoadConst(), "Expecting const child \n");
 
       int32_t arrayClassIndex = node->getSecondChild()->getInt();
-      struct J9Class ** arrayClasses = &self()->fej9()->getJ9JITConfig()->javaVM->booleanArrayClass;
-      clazz = arrayClasses[arrayClassIndex - 4];
+      clazz = (J9Class *) self()->fej9()->getClassFromNewArrayTypeNonNull(arrayClassIndex);
 
       if (node->getFirstChild()->getOpCodeValue() != TR::iconst)
          {
@@ -660,7 +651,8 @@ J9::Compilation::canAllocateInline(TR::Node* node, TR_OpaqueClassBlock* &classIn
       if (clazz == NULL)
          return -1;
 
-      clazz = (J9Class *)self()->fej9vm()->getArrayClassFromComponentClass((TR_OpaqueClassBlock *)clazz);
+      auto classOffset = self()->fej9()->getArrayClassFromComponentClass(TR::Compiler->cls.convertClassPtrToClassOffset(clazz));
+      clazz = TR::Compiler->cls.convertClassOffsetToClassPtr(classOffset);
       if (!clazz)
          return -1;
 
@@ -720,7 +712,7 @@ J9::Compilation::canAllocateInline(TR::Node* node, TR_OpaqueClassBlock* &classIn
 
    if (node->getOpCodeValue() == TR::newarray || self()->useCompressedPointers())
       {
-      size = (int32_t)((size+(TR::Compiler->om.sizeofReferenceAddress()-1)) & ~(TR::Compiler->om.sizeofReferenceAddress()-1));
+      size = (int32_t)OMR::align(size, TR::Compiler->om.sizeofReferenceAddress());
       }
 
    if (isRealTimeGC &&
@@ -916,11 +908,14 @@ J9::Compilation::verifyCompressedRefsAnchors(bool anchorize)
 #if 0 ///#ifdef DEBUG
                TR_ASSERT(0, "No anchor found for load/store [%p]", n);
 #else
-               // place anchor after tt if its a check
-               // otherwise before
+               // For the child of null check or resolve check, the side effect doesn't rely on the
+               // value of the child, thus the anchor needs to be placed after tt. For other nodes,
+               // place the anchor before tt.
                //
                TR::TreeTop *next = tt->getNextTreeTop();
-               if (tt->getNode()->getOpCode().isCheck())
+               if ((tt->getNode()->getOpCode().isNullCheck()
+                   || tt->getNode()->getOpCode().isResolveCheck())
+                   && n == tt->getNode()->getFirstChild())
                   {
                   tt->join(newTT);
                   newTT->join(next);

@@ -180,7 +180,11 @@ public:
 		{
 			UDATA classFlags = J9CLASS_FLAGS(clazz) & (J9AccClassReferenceMask | J9AccClassGCSpecial | J9AccClassOwnableSynchronizer);
 			if (0 == classFlags) {
-				result = SCAN_MIXED_OBJECT;
+				if (0 != clazz->selfReferencingField1) {
+					result = SCAN_MIXED_OBJECT_LINKED;
+				} else {
+					result = SCAN_MIXED_OBJECT;
+				}
 			} else {
 				if (0 != (classFlags & J9AccClassReferenceMask)) {
 					result = SCAN_REFERENCE_MIXED_OBJECT;
@@ -584,12 +588,10 @@ public:
 			size = ((J9IndexableObjectContiguous *)forwardedHeader->getObject())->size;
 		}
 
-#if defined(OMR_GC_HYBRID_ARRAYLETS)
 		if (0 == size) {
 			/* Discontiguous */
 			size = ((J9IndexableObjectDiscontiguous *)forwardedHeader->getObject())->size;
 		}
-#endif
 
 		return size;
 	}
@@ -605,7 +607,6 @@ public:
 	getPreservedArrayLayout(MM_ForwardedHeader *forwardedHeader)
 	{
 		GC_ArrayletObjectModel::ArrayLayout layout = GC_ArrayletObjectModel::InlineContiguous;
-#if defined(J9VM_GC_HYBRID_ARRAYLETS)
 		 uint32_t size = 0;
 #if defined (OMR_GC_COMPRESSED_POINTERS)
 		if (compressObjectReferences()) {
@@ -619,7 +620,6 @@ public:
 		if (0 != size) {
 			return layout;
 		}
-#endif /* J9VM_GC_HYBRID_ARRAYLETS */
 
 		/* we know we are dealing with heap object, so we don't need to check against _arrayletRangeBase/Top, like getArrayLayout does */
 		J9Class *clazz = getPreservedClass(forwardedHeader);

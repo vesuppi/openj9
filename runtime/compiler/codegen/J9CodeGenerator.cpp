@@ -42,6 +42,7 @@
 #include "env/VMAccessCriticalSection.hpp"
 #include "env/VMJ9.h"
 #include "env/jittypes.h"
+#include "env/j9method.h"
 #include "il/Block.hpp"
 #include "il/Node.hpp"
 #include "il/Node_inlines.hpp"
@@ -1197,8 +1198,7 @@ J9::CodeGenerator::lowerTreeIfNeeded(
                methodSymbol->getResolvedMethodSymbol() &&
                methodSymbol->getResolvedMethodSymbol()->getResolvedMethod())
             {
-            void * methodAddress = methodSymbol->getResolvedMethodSymbol()->getResolvedMethod()->startAddressForInterpreterOfJittedMethod();
-            TR_PersistentJittedBodyInfo * bodyInfo = TR::Recompilation::getJittedBodyInfoFromPC(methodAddress);
+            TR_PersistentJittedBodyInfo * bodyInfo = ((TR_ResolvedJ9Method*) methodSymbol->getResolvedMethodSymbol()->getResolvedMethod())->getExistingJittedBodyInfo();
             //printf("Pushing node %p\n", node);
             //fflush(stdout);
             if (bodyInfo &&
@@ -2266,143 +2266,6 @@ J9::CodeGenerator::doInstructionSelection()
       diagnostic("</selection>\n");
    }
 
-
-// J9, Z
-//
-// This can surely be done more efficiently.  Walk the CFG and go block by block
-// rather than iterating through TreeTops looking for BBStarts.
-//
-void
-J9::CodeGenerator::splitWarmAndColdBlocks()
-   {
-   if (!self()->allowSplitWarmAndColdBlocks() || self()->comp()->compileRelocatableCode())
-      {
-      return;
-      }
-
-   TR::Block * block = NULL;
-   TR::TreeTop * tt;
-   TR::Node * node;
-   TR::Block * firstColdBlock = NULL, * firstColdExtendedBlock = NULL;
-
-   for (tt = self()->comp()->getStartTree(); tt; tt = tt->getNextTreeTop())
-      {
-      node = tt->getNode();
-
-      if (node->getOpCodeValue() == TR::BBStart)
-         {
-         block = node->getBlock();
-
-         // If this is the first cold block, remember where the warm blocks ended.
-         // If it is a warm block and cold blocks have already been found, they
-         // are treated as warm.
-         //
-         if (block->isCold())
-            {
-            if (!firstColdBlock)
-               firstColdBlock = block;
-            }
-         else
-            {
-            firstColdBlock = NULL;
-            firstColdExtendedBlock = NULL;
-            }
-
-         if (!block->isExtensionOfPreviousBlock())
-            {
-            if (firstColdBlock && !firstColdExtendedBlock)
-               {
-               if (!block->getPrevBlock() ||
-                   !block->getPrevBlock()->canFallThroughToNextBlock())
-                  firstColdExtendedBlock = block;
-               else
-                  firstColdBlock = NULL;
-               }
-            }
-         }
-      }
-
-   // Mark the split point between warm and cold blocks, so they can be
-   // allocated in different code sections.
-   //
-   TR::Block *lastWarmBlock;
-   if (firstColdExtendedBlock)
-      {
-      lastWarmBlock = firstColdExtendedBlock->getPrevBlock();
-      if (!lastWarmBlock)
-         {
-         // All the blocks are cold: insert a new goto block ahead of real blocks
-         lastWarmBlock = TR::TransformUtil::insertNewFirstBlockForCompilation(self()->comp());
-         }
-      }
-   else
-      {
-      // All the blocks are warm - the split point is between the last
-      // instruction and the snippets.
-      //
-      lastWarmBlock = block;
-      }
-
-   // If the last tree in the last warm block is not a TR::Goto, insert a goto tree
-   // at the end of the block.
-   // If there is a following block the goto will branch to it so that when the
-   // code is split any fall-through will go to the right place.
-   // If there is no following block the goto will branch to the first block; in
-   // this case the goto should never be reached, it is there only to
-   // make sure that the instruction following the last real treetop will be in
-   // warm code, so if it is a helper call (e.g. for a throw) the return address
-   // is in this method's code.
-   //
-   if (lastWarmBlock->getNumberOfRealTreeTops() == 0)
-      tt = lastWarmBlock->getEntry();
-   else
-      tt = lastWarmBlock->getLastRealTreeTop();
-
-   node = tt->getNode();
-
-   if (!(node->getOpCode().isGoto() || node->getOpCode().isJumpWithMultipleTargets() || node->getOpCode().isReturn()))
-      {
-      // Find the block to be branched to
-      //
-      TR::TreeTop * targetTreeTop = lastWarmBlock->getExit()->getNextTreeTop();
-      if (targetTreeTop)
-         {
-         // Branch to following block. Make sure it is not marked as an
-         // extension block so that it will get a label generated.
-         //
-         targetTreeTop->getNode()->getBlock()->setIsExtensionOfPreviousBlock(false);
-         }
-      else
-         {
-         // Branch to the first block. This will not be marked as an extension
-         // block.
-         targetTreeTop = self()->comp()->getStartBlock()->getEntry();
-         }
-
-      // Generate the goto and insert it into the end of the last warm block.
-      //
-      TR::TreeTop *gotoTreeTop = TR::TreeTop::create(self()->comp(), TR::Node::create(node, TR::Goto, 0, targetTreeTop));
-
-      // Move reg deps from BBEnd to goto
-      //
-      TR::Node *bbEnd = lastWarmBlock->getExit()->getNode();
-      if (bbEnd->getNumChildren() > 0)
-         {
-         TR::Node *glRegDeps = bbEnd->getChild(0);
-
-         gotoTreeTop->getNode()->setNumChildren(1);
-         gotoTreeTop->getNode()->setChild(0, glRegDeps);
-
-         bbEnd->setChild(0,NULL);
-         bbEnd->setNumChildren(0);
-         }
-
-      tt->insertAfter(gotoTreeTop);
-      }
-
-   }
-
-
 void
 J9::CodeGenerator::populateOSRBuffer()
    {
@@ -3376,7 +3239,7 @@ J9::CodeGenerator::rematerializeCompressedRefs(
       TR::Node *child = node->getChild(i);
       self()->rematerializeCompressedRefs(autoSymRef, tt, node, i, child, visitCount, rematerializedNodes);
       }
-   
+
    static bool disableBranchlessPassThroughNULLCHK = feGetEnv("TR_disableBranchlessPassThroughNULLCHK") != NULL;
    if (node->getOpCode().isNullCheck() && reference &&
           (!isLowMemHeap || self()->performsChecksExplicitly() || (disableBranchlessPassThroughNULLCHK && node->getFirstChild()->getOpCodeValue() == TR::PassThrough)) &&
@@ -4680,9 +4543,9 @@ J9::CodeGenerator::wantToPatchClassPointer(const TR_OpaqueClassBlock *allegedCla
    }
 
 bool
-J9::CodeGenerator::supportsMethodEntryPadding()
+J9::CodeGenerator::supportsJitMethodEntryAlignment()
    {
-   return self()->fej9()->supportsMethodEntryPadding();
+   return self()->fej9()->supportsJitMethodEntryAlignment();
    }
 
 bool
@@ -4703,7 +4566,7 @@ J9::CodeGenerator::generateCatchBlockBBStartPrologue(
       TR::Node *node,
       TR::Instruction *fenceInstruction)
    {
-   if (self()->comp()->getOptions()->getReportByteCodeInfoAtCatchBlock())
+   if (self()->comp()->fej9vm()->getReportByteCodeInfoAtCatchBlock())
       {
       // Note we should not use `fenceInstruction` here because it is not the first instruction in this BB. The first
       // instruction is a label that incoming branches will target. We will use this label (first instruction in the
@@ -4887,7 +4750,7 @@ J9::CodeGenerator::allocateCodeMemoryInner(
          coldCodeSizeInBytes,
          &codeCache,
          coldCode,
-         comp->compileRelocatableCode(),
+         self()->fej9()->needsContiguousCodeAndDataCacheAllocation(),
          isMethodHeaderNeeded);
 
    self()->fej9()->acquireClassUnloadMonitorAndReleaseVMAccessIfNeeded(comp, hadVMAccess, hadClassUnloadMonitor);

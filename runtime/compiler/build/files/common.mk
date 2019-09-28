@@ -25,8 +25,10 @@ JIT_PRODUCT_BACKEND_SOURCES+=\
     compiler/optimizer/AllocationSinking.cpp \
     compiler/optimizer/DataAccessAccelerator.cpp \
     compiler/optimizer/DynamicLiteralPool.cpp \
-    compiler/optimizer/EscapeAnalysis.cpp \
 compiler/optimizer/OHAEA.cpp \
+    compiler/optimizer/EscapeAnalysis.cpp \
+    compiler/optimizer/PreEscapeAnalysis.cpp \
+    compiler/optimizer/PostEscapeAnalysis.cpp \
     compiler/optimizer/FearPointAnalysis.cpp \
     compiler/optimizer/HCRGuardAnalysis.cpp \
     compiler/optimizer/IdiomRecognition.cpp \
@@ -248,7 +250,6 @@ compiler/optimizer/OHAEA.cpp \
     omr/compiler/ras/LimitFile.cpp \
     omr/compiler/ras/LogTracer.cpp \
     omr/compiler/ras/OptionsDebug.cpp \
-    omr/compiler/ras/PPCOpNames.cpp \
     omr/compiler/ras/Tree.cpp
 
 JIT_PRODUCT_SOURCE_FILES+=\
@@ -381,8 +382,30 @@ JIT_PRODUCT_SOURCE_FILES+=\
     omr/compiler/runtime/OMRCodeCacheMemorySegment.cpp \
     omr/compiler/runtime/OMRRuntimeAssumptions.cpp
 
+ifneq ($(JITSERVER_SUPPORT),)
+JIT_PRODUCT_SOURCE_FILES+=\
+    compiler/control/JITServerCompilationThread.cpp \
+    compiler/control/JITServerHelpers.cpp \
+    compiler/env/j9methodServer.cpp \
+    compiler/env/JITServerCHTable.cpp \
+    compiler/env/JITServerPersistentCHTable.cpp \
+    compiler/env/VMJ9Server.cpp \
+    compiler/net/ClientStream.cpp \
+    compiler/net/CommunicationStream.cpp \
+    compiler/net/ProtobufTypeConvert.cpp \
+    compiler/net/ServerStream.cpp \
+    compiler/runtime/CompileService.cpp \
+    compiler/runtime/JITClientSession.cpp \
+    compiler/runtime/JITServerIProfiler.cpp \
+    compiler/runtime/JITServerStatisticsThread.cpp \
+    compiler/runtime/Listener.cpp
+endif
+
 -include $(JIT_MAKE_DIR)/files/extra.mk
 include $(JIT_MAKE_DIR)/files/host/$(HOST_ARCH).mk
 include $(JIT_MAKE_DIR)/files/target/$(TARGET_ARCH).mk
 -include $(JIT_MAKE_DIR)/files/host/$(HOST_ARCH)-extra.mk
 -include $(JIT_MAKE_DIR)/files/target/$(TARGET_ARCH)-extra.mk
+ifneq ($(JITSERVER_SUPPORT),)
+include $(JIT_MAKE_DIR)/files/net.mk
+endif

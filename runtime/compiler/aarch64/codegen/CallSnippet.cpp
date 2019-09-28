@@ -275,6 +275,20 @@ uint8_t *TR::ARM64CallSnippet::emitSnippetBody()
    return cursor+4;
    }
 
+void
+TR_Debug::print(TR::FILE *pOutFile, TR::ARM64CallSnippet * snippet)
+   {
+   TR::Node            *callNode     = snippet->getNode();
+   TR::SymbolReference *glueRef      = _cg->getSymRef(snippet->getHelper());;
+   TR::SymbolReference *methodSymRef = callNode->getSymbolReference();
+   TR::MethodSymbol    *methodSymbol = methodSymRef->getSymbol()->castToMethodSymbol();
+
+   uint8_t *bufferPos = snippet->getSnippetLabel()->getCodeLocation();
+   printSnippetLabel(pOutFile, snippet->getSnippetLabel(), bufferPos, getName(snippet), getName(methodSymRef));
+
+   //TODO print snippet body
+   }
+
 uint32_t TR::ARM64CallSnippet::getLength(int32_t estimatedSnippetStart)
    {
    return (instructionCountForArguments(getNode(), cg()) + 6) * 4;
@@ -348,9 +362,17 @@ uint8_t *TR::ARM64UnresolvedCallSnippet::emitSnippetBody()
    return cursor + 8;
    }
 
+void
+TR_Debug::print(TR::FILE *pOutFile, TR::ARM64UnresolvedCallSnippet * snippet)
+   {
+   print(pOutFile, (TR::ARM64CallSnippet *) snippet);
+
+   //TODO print snippet body
+   }
+
 uint32_t TR::ARM64UnresolvedCallSnippet::getLength(int32_t estimatedSnippetStart)
    {
-   return TR::ARM64CallSnippet::getLength(estimatedSnippetStart) + 12;
+   return TR::ARM64CallSnippet::getLength(estimatedSnippetStart) + 16;
    }
 
 uint8_t *TR::ARM64VirtualUnresolvedSnippet::emitSnippetBody()
@@ -392,9 +414,20 @@ uint8_t *TR::ARM64VirtualUnresolvedSnippet::emitSnippetBody()
    return cursor + 8;
    }
 
+void
+TR_Debug::print(TR::FILE *pOutFile, TR::ARM64VirtualUnresolvedSnippet * snippet)
+   {
+   TR::SymbolReference *callSymRef = snippet->getNode()->getSymbolReference();
+   uint8_t *bufferPos = snippet->getSnippetLabel()->getCodeLocation();
+
+   printSnippetLabel(pOutFile, snippet->getSnippetLabel(), bufferPos, getName(snippet), getName(callSymRef));
+
+   //TODO print snippet body
+   }
+
 uint32_t TR::ARM64VirtualUnresolvedSnippet::getLength(int32_t estimatedSnippetStart)
    {
-   return 24;
+   return 28;
    }
 
 uint8_t *TR::ARM64InterfaceCallSnippet::emitSnippetBody()
@@ -441,9 +474,20 @@ uint8_t *TR::ARM64InterfaceCallSnippet::emitSnippetBody()
    return cursor;
    }
 
+void
+TR_Debug::print(TR::FILE *pOutFile, TR::ARM64InterfaceCallSnippet * snippet)
+   {
+   TR::SymbolReference *callSymRef = snippet->getNode()->getSymbolReference();
+   uint8_t *bufferPos = snippet->getSnippetLabel()->getCodeLocation();
+
+   printSnippetLabel(pOutFile, snippet->getSnippetLabel(), bufferPos, getName(snippet), getName(callSymRef));
+
+   //TODO print snippet body
+   }
+
 uint32_t TR::ARM64InterfaceCallSnippet::getLength(int32_t estimatedSnippetStart)
    {
-   return 32;
+   return 44;
    }
 
 uint8_t *TR::ARM64CallSnippet::generateVIThunk(TR::Node *callNode, int32_t argSize, TR::CodeGenerator *cg)

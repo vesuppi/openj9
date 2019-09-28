@@ -3012,11 +3012,35 @@ TR::Register *J9::X86::TreeEvaluator::BNDCHKwithSpineCHKEvaluator(TR::Node *node
             }
          else
             {
-            // Check the bounds.
-            //
-            TR::TreeEvaluator::compareIntegersForOrder(node, indexChild, arrayLengthChild, cg);
-            branchOpCode = JAE4;
-            faultingInstruction = cg->getImplicitExceptionPoint();
+            TR::DataType dt = loadOrStoreChild->getDataType();
+            int32_t elementSize = (dt == TR::Address) ?  TR::Compiler->om.sizeofReferenceField()
+                                                      : TR::Symbol::convertTypeToSize(dt);
+
+            if (TR::Compiler->om.isDiscontiguousArray(arrayLengthChild->getInt(), elementSize))
+               {
+               // Create real check failure snippet if we can prove the spine check
+               // will always fail
+               //
+               branchOpCode = JMP4;
+               cg->decReferenceCount(arrayLengthChild);
+               if (!indexChild->getOpCode().isLoadConst())
+                  {
+                  cg->evaluate(indexChild);
+                  }
+               else
+                  {
+                  cg->decReferenceCount(indexChild);
+                  }
+               faultingInstruction = cg->getImplicitExceptionPoint();
+               }
+            else
+               {
+               // Check the bounds.
+               //
+               TR::TreeEvaluator::compareIntegersForOrder(node, indexChild, arrayLengthChild, cg);
+               branchOpCode = JAE4;
+               faultingInstruction = cg->getImplicitExceptionPoint();
+               }
             }
          }
       else
@@ -3949,9 +3973,21 @@ inline void generateInlinedCheckCastOrInstanceOfForInterface(TR::Node* node, TR_
 inline void generateInlinedCheckCastOrInstanceOfForClass(TR::Node* node, TR_OpaqueClassBlock* clazz, TR::CodeGenerator* cg, bool isCheckCast)
    {
    auto fej9 = (TR_J9VMBase*)(cg->fe());
-   auto use64BitClasses = TR::Compiler->target.is64Bit() &&
-                             (!TR::Compiler->om.generateCompressedObjectHeaders() ||
-                              (cg->comp()->compileRelocatableCode() && cg->comp()->getOption(TR_UseSymbolValidationManager)));
+
+   bool use64BitClasses = false;
+   if (TR::Compiler->target.is64Bit())
+      {
+      // When running 64 bit compressed refs, if clazz is an address above the 2G
+      // boundary then we can't use a push 32bit immediate instruction to pass it
+      // to the helper as the address gets sign extended. So we need to test for
+      // this case and switch to the 64bit memory to memory encoding
+      // that is used when running 64 bit non-compressed.
+      auto highClass = ((uintptr_t)clazz) > INT_MAX;
+
+      use64BitClasses = !TR::Compiler->om.generateCompressedObjectHeaders() ||
+                        highClass ||
+                        (cg->comp()->compileRelocatableCode() && cg->comp()->getOption(TR_UseSymbolValidationManager));
+      }
 
    auto clazzData = use64BitClasses ? cg->create8ByteData(node, (uint64_t)(uintptr_t)clazz) : NULL;
    if (clazzData)
@@ -12940,4 +12976,3 @@ TR::Register *J9::X86::TreeEvaluator::awrtbarEvaluator(TR::Node *node, TR::CodeG
    // counts of the children evaluated here and let this helper handle it.
    return TR::TreeEvaluator::writeBarrierEvaluator(node, cg);
    }
-

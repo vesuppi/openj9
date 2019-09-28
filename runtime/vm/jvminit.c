@@ -267,7 +267,7 @@ static IDATA checkDjavacompiler (J9PortLibrary *portLibrary, J9VMInitArgs* j9vm_
 #endif /* J9VM_OPT_SIDECAR */
 static void* getOptionExtraInfo (J9PortLibrary *portLibrary, J9VMInitArgs* j9vm_args, IDATA match, char* optionName);
 static void closeAllDLLs (J9JavaVM* vm);
-static UDATA checkArgsConsumed (J9PortLibrary* portLibrary, J9VMInitArgs* j9vm_args);
+static UDATA checkArgsConsumed (J9JavaVM * vm, J9PortLibrary* portLibrary, J9VMInitArgs* j9vm_args);
 
 #if (defined(J9VM_INTERP_VERBOSE))
 static const char* getNameForStage (IDATA stage);
@@ -1820,8 +1820,15 @@ IDATA VMInitStages(J9JavaVM *vm, IDATA stage, void* reserved) {
 				 */
 				if (argIndex2 > argIndex) {
 					j9port_control(J9PORT_CTLDATA_VMEM_ADVISE_HUGEPAGE, 1);
-				} else {
+				} else if (argIndex > argIndex2){
 					j9port_control(J9PORT_CTLDATA_VMEM_ADVISE_HUGEPAGE, 0);
+				} else {
+#if defined(LINUX) && defined(J9VM_ARCH_X86)
+					/* Enable THP on xLinux by default */
+					j9port_control(J9PORT_CTLDATA_VMEM_ADVISE_HUGEPAGE, 1);
+#else
+					j9port_control(J9PORT_CTLDATA_VMEM_ADVISE_HUGEPAGE, 0);
+#endif /* defined(LINUX) && defined(J9VM_ARCH_X86) */
 				}
 			}
 
@@ -1966,6 +1973,16 @@ IDATA VMInitStages(J9JavaVM *vm, IDATA stage, void* reserved) {
 					Trc_VM_CgroupSubsystemsNotEnabled(vm->mainThread, subsystemsAvailable, subsystemsEnabled);
 				}
 			}
+
+			argIndex = FIND_AND_CONSUME_ARG(EXACT_MATCH, VMOPT_XXDEEP_SCAN, NULL);
+			argIndex2 = FIND_AND_CONSUME_ARG(EXACT_MATCH, VMOPT_XXNODEEP_SCAN, NULL);
+
+			/* Enable Deep Structure Priority Scan by default */
+			vm->extendedRuntimeFlags2 |= J9_EXTENDED_RUNTIME2_ENABLE_DEEPSCAN;
+			if (argIndex2 > argIndex) {
+				vm->extendedRuntimeFlags2 &= ~J9_EXTENDED_RUNTIME2_ENABLE_DEEPSCAN;
+			}
+
 			parseError = setMemoryOptionToOptElse(vm, &(vm->directByteBufferMemoryMax),
 					VMOPT_XXMAXDIRECTMEMORYSIZEEQUALS, (UDATA) -1, TRUE);
 			if (OPTION_OK != parseError) {
@@ -2391,7 +2408,7 @@ IDATA VMInitStages(J9JavaVM *vm, IDATA stage, void* reserved) {
 
 /* Run after all command-line args should have been consumed. Returns TRUE or FALSE. */
 
-static UDATA checkArgsConsumed(J9PortLibrary* portLibrary, J9VMInitArgs* j9vm_args) {
+static UDATA checkArgsConsumed(J9JavaVM * vm, J9PortLibrary* portLibrary, J9VMInitArgs* j9vm_args) {
 	UDATA i = 0;
 	PORT_ACCESS_FROM_PORT(portLibrary);
 	jboolean ignoreUnrecognized = j9vm_args->actualVMArgs->ignoreUnrecognized;
@@ -2420,6 +2437,16 @@ static UDATA checkArgsConsumed(J9PortLibrary* portLibrary, J9VMInitArgs* j9vm_ar
 		if (xxIgnoreUnrecognizedXXColonOptionsDisableIndex > xxIgnoreUnrecognizedXXColonOptionsEnableIndex) {
 			ignoreUnrecongizedXXColonOptions = JNI_FALSE;
 		}
+	}
+
+	/* Consuming the shared class options if it is used without -Xshareclasses */
+	if (!ignoreUnrecongizedXXColonOptions && !vm->sharedCacheAPI->xShareClassesPresent) {
+		findArgInVMArgs( PORTLIB, j9vm_args, EXACT_MATCH, VMOPT_XXSHARECLASSESENABLEBCI, NULL, TRUE);
+		findArgInVMArgs( PORTLIB, j9vm_args, EXACT_MATCH, VMOPT_XXSHARECLASSESDISABLEBCI, NULL, TRUE);
+		findArgInVMArgs( PORTLIB, j9vm_args, EXACT_MATCH, VMOPT_XXENABLESHAREANONYMOUSCLASSES, NULL, TRUE);
+		findArgInVMArgs( PORTLIB, j9vm_args, EXACT_MATCH, VMOPT_XXDISABLESHAREANONYMOUSCLASSES, NULL, TRUE);
+		findArgInVMArgs( PORTLIB, j9vm_args, EXACT_MATCH, VMOPT_XXENABLESHAREUNSAFECLASSES, NULL, TRUE);
+		findArgInVMArgs( PORTLIB, j9vm_args, EXACT_MATCH, VMOPT_XXDISABLESHAREUNSAFECLASSES, NULL, TRUE);
 	}
 
 	for (i=0; i<j9vm_args->nOptions; i++) {
@@ -2967,10 +2994,10 @@ processVMArgsFromFirstToLast(J9JavaVM * vm)
 	}
 	vm->extendedRuntimeFlags |= J9_EXTENDED_RUNTIME_OSR_SAFE_POINT; /* Enable OSR safe point by default */
 	vm->extendedRuntimeFlags |= (UDATA)J9_EXTENDED_RUNTIME_ENABLE_HCR; /* Enable HCR by default */
-#if defined(J9VM_ARCH_X86)
-	/* Enabled field watch by default on x86 platforms */
+#if defined(J9VM_ARCH_X86) || defined(J9VM_ARCH_POWER) || defined(J9VM_ARCH_S390)
+	/* Enabled field watch by default on x86, Power, and S390 platforms */
 	vm->extendedRuntimeFlags |= J9_EXTENDED_RUNTIME_JIT_INLINE_WATCHES;
-#endif /* J9VM_ARCH_X86 */
+#endif /* J9VM_ARCH_X86, J9VM_ARCH_POWER, J9VM_ARCH_S390 */
 	{
 		IDATA noStackTraceInThrowable = FIND_AND_CONSUME_ARG(EXACT_MATCH, VMOPT_XXNOSTACKTRACEINTHROWABLE, NULL);
 		IDATA stackTraceInThrowable = FIND_AND_CONSUME_ARG(EXACT_MATCH, VMOPT_XXSTACKTRACEINTHROWABLE, NULL);
@@ -5624,6 +5651,18 @@ protectedInitializeJavaVM(J9PortLibrary* portLibrary, void * userData)
 #endif
 
 	PORT_ACCESS_FROM_PORT(portLibrary);
+	IDATA queryResult = 0;
+	J9CacheInfoQuery cQuery = {0};
+	cQuery.cmd = J9PORT_CACHEINFO_QUERY_LINESIZE;
+	cQuery.level = 1;
+	cQuery.cacheType = J9PORT_CACHEINFO_DCACHE;
+	queryResult = j9sysinfo_get_cache_info(&cQuery);
+	if (queryResult > 0) {
+		vm->dCacheLineSize = (UDATA)queryResult;
+	} else {
+		Trc_VM_contendedLinesizeFailed(queryResult);
+	}
+
 	/* check for -Xipt flag and run the iconv_global_init accordingly.
 	 * If this function fails, bail out of VM init instead of hitting some random
 	 * weird undebuggable crash later on
@@ -5936,7 +5975,7 @@ protectedInitializeJavaVM(J9PortLibrary* portLibrary, void * userData)
 		goto error;
 	}
 
-	if (FALSE == checkArgsConsumed(portLibrary, vm->vmArgsArray)) {
+	if (FALSE == checkArgsConsumed(vm, portLibrary, vm->vmArgsArray)) {
 		parseError = TRUE;
 		goto error;
 	}

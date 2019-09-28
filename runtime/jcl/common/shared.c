@@ -239,7 +239,8 @@ createCPEntries(JNIEnv* env, jint helperID, jint urlCount, J9ClassPathEntry** cp
 	PORT_ACCESS_FROM_VMC((J9VMThread*)env);
 
 	Trc_JCL_com_ibm_oti_shared_createCPEntries_Entry(env, helperID, urlCount);
-	
+	Assert_JCL_true(urlCount > 0);
+
 	cpEntrySize = urlCount * sizeof(struct J9ClassPathEntry);
 	cpEntries = j9mem_allocate_memory(cpEntrySize, J9MEM_CATEGORY_VM_JCL);
 	if (NULL == cpEntries) {
@@ -1972,6 +1973,11 @@ Java_com_ibm_oti_shared_SharedClassURLClasspathHelperImpl_notifyClasspathChange3
 
 	Trc_JCL_com_ibm_oti_shared_SharedClassURLClasspathHelperImpl_notifyClasspathChange3_Entry(env);
 
+	if (0 == urlCount) {
+		Trc_JCL_com_ibm_oti_shared_SharedClassURLClasspathHelperImpl_notifyClasspathChange3_ExitUrlCountZero(env);
+		return;
+	}
+
 	if (vm->sharedClassConfig->runtimeFlags & J9SHR_RUNTIMEFLAG_ENABLE_URL_TIMESTAMP_CHECK) {
 		Trc_JCL_com_ibm_oti_shared_SharedClassURLClasspathHelperImpl_notifyClasspathChange3_ExitEnableCheck(env);
 		return;
@@ -2244,7 +2250,7 @@ Java_com_ibm_oti_shared_SharedClassUtilities_init(JNIEnv *env, jclass clazz) {
 	JCL_CACHE_SET(env, CLS_com_ibm_oti_shared_SharedClassCacheInfo, javaClass);
 
 	/* get methodID of SharedClassCacheInfo constructor */
-	mid = (*env)->GetMethodID(env, javaClass, "<init>", "(Ljava/lang/String;ZZIIJIIZJJIJ)V");
+	mid = (*env)->GetMethodID(env, javaClass, "<init>", "(Ljava/lang/String;ZZIIJIIZJJIJI)V");
 	if (NULL == mid) {
 		return;
 	}
@@ -2308,7 +2314,8 @@ populateSharedCacheInfo(J9JavaVM *vm, J9SharedCacheInfo *event_data, void *user_
 												(-1 == event_data->cacheSize) ? (jlong) -1 : (jlong) event_data->cacheSize,
 												(-1 == event_data->freeBytes) ? (jlong) -1 : (jlong) event_data->freeBytes,
 												(jint)event_data->cacheType,
-												((UDATA)-1 == event_data->softMaxBytes) ? (jlong) -1 : (jlong) event_data->softMaxBytes
+												((UDATA)-1 == event_data->softMaxBytes) ? (jlong) -1 : (jlong) event_data->softMaxBytes,
+												(jint) event_data->layer
 												);
 	if (NULL == sharedCacheInfoObject) {
 		return -1;

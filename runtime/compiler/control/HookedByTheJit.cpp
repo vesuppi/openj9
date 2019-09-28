@@ -78,6 +78,10 @@
 #include "runtime/HWProfiler.hpp"
 #include "runtime/LMGuardedStorage.hpp"
 #include "env/SystemSegmentProvider.hpp"
+#if defined(JITSERVER_SUPPORT)
+#include "runtime/Listener.hpp"
+#include "runtime/JITServerStatisticsThread.hpp"
+#endif
 
 extern "C" {
 struct J9JavaVM;
@@ -444,7 +448,7 @@ static void jitHookInitializeSendTarget(J9HookInterface * * hook, UDATA eventNum
       if (J9UTF8_LENGTH(className) == 36
           && J9UTF8_LENGTH(name) == 21
           && 0==memcmp(utf8Data(className), "com/ibm/rmi/io/FastPathForCollocated", 36)
-          && 0==memcmp(utf8Data(J9ROMMETHOD_GET_NAME(declaringClazz, romMethod)), "isVMDeepCopySupported", 21)
+          && 0==memcmp(utf8Data(J9ROMMETHOD_NAME(romMethod)), "isVMDeepCopySupported", 21)
          )
          {
          count = 0;
@@ -452,15 +456,18 @@ static void jitHookInitializeSendTarget(J9HookInterface * * hook, UDATA eventNum
       else if (J9UTF8_LENGTH(className) == 39
           && J9UTF8_LENGTH(name) == 9
           && 0 == memcmp(utf8Data(className), "java/util/concurrent/ThreadPoolExecutor", 39)
-          && 0 == memcmp(utf8Data(J9ROMMETHOD_GET_NAME(declaringClazz, romMethod)), "runWorker", 9)
+          && 0 == memcmp(utf8Data(J9ROMMETHOD_NAME(romMethod)), "runWorker", 9)
           )
          {
          count = 0;
          }
       else if (TR::Options::sharedClassCache())
          {
+         // The default FE may not have TR_J9SharedCache object because the FE may have
+         // been created before options were processed.
+         TR_J9SharedCache *sc = TR_J9VMBase::get(jitConfig, vmThread, TR_J9VMBase::AOT_VM)->sharedCache();
 #if defined(J9VM_INTERP_AOT_COMPILE_SUPPORT) && defined(J9VM_OPT_SHARED_CLASSES) && (defined(TR_HOST_X86) || defined(TR_HOST_POWER) || defined(TR_HOST_S390) || defined(TR_HOST_ARM))
-         if (compInfo->reloRuntime()->isRomClassForMethodInSharedCache(method, jitConfig->javaVM))
+         if (TR_J9VMBase::get(jitConfig, vmThread, TR_J9VMBase::AOT_VM)->sharedCache()->isPointerInSharedCache(J9_CLASS_FROM_METHOD(method)->romClass))
             {
             PORT_ACCESS_FROM_JAVAVM(jitConfig->javaVM);
             I_64 sharedQueryTime = 0;
@@ -471,11 +478,7 @@ static void jitHookInitializeSendTarget(J9HookInterface * * hook, UDATA eventNum
                {
                int32_t scount = optionsAOT->getInitialSCount();
                uint16_t newScount = 0;
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-               if ((TR_J9SharedCache *)(((TR_J9VMBase *) fe)->sharedCache())->isHint(method, TR_HintFailedValidation, &newScount))
-#else
-               if (((TR_J9VMBase *) fe)->isSharedCacheHint(method, TR_HintFailedValidation, &newScount))
-#endif
+               if (sc->isHint(method, TR_HintFailedValidation, &newScount))
                   {
                   if ((scount == TR_QUICKSTART_INITIAL_SCOUNT) || (scount == TR_INITIAL_SCOUNT))
                      { // If scount is not user specified (coarse way due to info being lost from options parsing)
@@ -492,22 +495,45 @@ static void jitHookInitializeSendTarget(J9HookInterface * * hook, UDATA eventNum
             // AOT Body not in SCC, so scount was not set
             else if (!TR::Options::getCountsAreProvidedByUser())
                {
-               // Because C-interpreter is slower we need to rely more on jitted code
-               // This means compiling more, but we have to be careful
-               // Let's use some smaller than normal counts, but only if
-               // 1) Quickstart - because we don't risk losing iprofiling info
-               // 2) GracePeriod - because we want to limit the number of 'extra'
-               //                  compilations and short apps are affected more
-               // 3) Bootstrap - same as above, plus if these methods get into the
-               //                SCC I would rather have non-app specific methods
-               // 4) Cold run - we want to avoid extra compilations in warm runs
-               // The danger is that very small applications that don't even get to AOT 200 methods
-               // may think that the runs are always cold
-               if (TR::Options::getCmdLineOptions()->getOption(TR_LowerCountsForAotCold) &&
-                   compInfo->isWarmSCC() == TR_no &&
-                   compInfo->getPersistentInfo()->getElapsedTime() <= (uint64_t)compInfo->getPersistentInfo()->getClassLoadingPhaseGracePeriod() &&
-                   TR::Options::isQuickstartDetected() &&
-                   fe->isClassLibraryMethod((TR_OpaqueMethodBlock *)method)) // is this an expensive call here?
+               bool useLowerCountsForAOTCold = false;
+               if (TR::Options::getCmdLineOptions()->getOption(TR_LowerCountsForAotCold) && compInfo->isWarmSCC() == TR_no)
+                  {
+                  // Because C-interpreter is slower we need to rely more on jitted code
+                  // This means compiling more, but we have to be careful.
+                  // Let's use some smaller than normal counts in the cold run (to avoid
+                  // extra compilations in the warm runs), but only if
+                  //
+                  // 1) The Default SCC isn't used - because we don't want to increase footprint
+                  //
+                  // OR
+                  //
+                  // 1) Quickstart - because we don't risk losing iprofiling info
+                  // 2) GracePeriod - because we want to limit the number of 'extra'
+                  //                  compilations and short apps are affected more
+                  // 3) Bootstrap - same as above, plus if these methods get into the
+                  //                SCC I would rather have non-app specific methods
+                  //
+                  // The danger is that very small applications that don't even get to AOT 200 methods
+                  // may think that the runs are always cold
+
+
+                  // J9SHR_RUNTIMEFLAG_ENABLE_CACHE_NON_BOOT_CLASSES is a good proxy for whether the
+                  // Default SCC is set because, when -Xshareclasses option is used, by default non
+                  // bootstrap loaded classes are put into the SCC. However, if the -Xshareclasses
+                  // option isn't used, then the Default SCC only contains bootstrap loaded classes.
+                  if (J9_ARE_ALL_BITS_SET(jitConfig->javaVM->sharedClassConfig->runtimeFlags, J9SHR_RUNTIMEFLAG_ENABLE_CACHE_NON_BOOT_CLASSES))
+                     {
+                     useLowerCountsForAOTCold = true;
+                     }
+                  else if (compInfo->getPersistentInfo()->getElapsedTime() <= (uint64_t)compInfo->getPersistentInfo()->getClassLoadingPhaseGracePeriod() &&
+                           TR::Options::isQuickstartDetected() &&
+                           fe->isClassLibraryMethod((TR_OpaqueMethodBlock *)method))
+                     {
+                     useLowerCountsForAOTCold = true;
+                     }
+                  }
+
+               if (useLowerCountsForAOTCold)
                   {
                   // TODO: modify the function that reads a specified count such that
                   // if the user specifies a count or bcount on the command line that is obeyed
@@ -527,11 +553,7 @@ static void jitHookInitializeSendTarget(J9HookInterface * * hook, UDATA eventNum
                    jitConfig->javaVM->phase != J9VM_PHASE_NOT_STARTUP &&
                    (TR_HintMethodCompiledDuringStartup & TR::Options::getAOTCmdLineOptions()->getEnableSCHintFlags()))
                   {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-                  bool wasCompiledDuringStartup = (TR_J9SharedCache *)(fe->sharedCache())->isHint(method, TR_HintMethodCompiledDuringStartup);
-#else
-                  bool wasCompiledDuringStartup = fe->isSharedCacheHint(method, TR_HintMethodCompiledDuringStartup);
-#endif
+                  bool wasCompiledDuringStartup = sc->isHint(method, TR_HintMethodCompiledDuringStartup);
                   if (wasCompiledDuringStartup)
                      {
                      // Lower the counts for any method that doesn't have an AOT body,
@@ -607,7 +629,7 @@ static void jitHookInitializeSendTarget(J9HookInterface * * hook, UDATA eventNum
       int32_t sigLen = sprintf(buf, "%.*s.%.*s%.*s", className->length, utf8Data(className), name->length, utf8Data(name), signature->length, utf8Data(signature));
       printf("Initial: Signature %s Count %d isLoopy %d isAOT %d is in SCC %d SCCContainsProfilingInfo %d \n",buf,TR::CompilationInfo::getInvocationCount(method),J9ROMMETHOD_HAS_BACKWARDS_BRANCHES(romMethod),
             TR::Options::sharedClassCache() ? jitConfig->javaVM->sharedClassConfig->existsCachedCodeForROMMethod(vmThread, romMethod) : 0,
-            TR::Options::sharedClassCache() ? compInfo->isRomClassForMethodInSharedCache(method, jitConfig->javaVM) : 0,containsInfo) ; fflush(stdout);
+            TR::Options::sharedClassCache() ? TR_J9VMBase::get(jitConfig, vmThread, TR_J9VMBase::AOT_VM)->sharedCache()->isPointerInSharedCache(J9_CLASS_FROM_METHOD(method)->romClass) : 0,containsInfo) ; fflush(stdout);
       }
    }
 
@@ -3189,14 +3211,14 @@ static void updateOverriddenFlag( J9VMThread *vm , J9Class *cl)
             {
          char *classNameChars = (char *)J9UTF8_DATA(J9ROMCLASS_CLASSNAME(ROMCl));
          int32_t classNameLen = (int32_t)J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(ROMCl));
-         char *superSignature = (char*)J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(J9_CLASS_FROM_METHOD(superMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
-         int32_t superSigLen = (int32_t)J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(J9_CLASS_FROM_METHOD(superMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
-         char *superName = (char*)J9UTF8_DATA(J9ROMMETHOD_GET_NAME(J9_CLASS_FROM_METHOD(superMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
-         int32_t superNameLen = (int32_t) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(J9_CLASS_FROM_METHOD(superMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
-         char *subSignature = (char*)J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(J9_CLASS_FROM_METHOD(subMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
-         int32_t subSigLen = (int32_t)J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(J9_CLASS_FROM_METHOD(subMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
-         char *subName = (char*)J9UTF8_DATA(J9ROMMETHOD_GET_NAME(J9_CLASS_FROM_METHOD(subMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
-         int32_t subNameLen = (int32_t)J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(J9_CLASS_FROM_METHOD(subMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
+         char *superSignature = (char*)J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
+         int32_t superSigLen = (int32_t)J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
+         char *superName = (char*)J9UTF8_DATA(J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
+         int32_t superNameLen = (int32_t) J9UTF8_LENGTH(J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(superMethod)));
+         char *subSignature = (char*)J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
+         int32_t subSigLen = (int32_t)J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
+         char *subName = (char*)J9UTF8_DATA(J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
+         int32_t subNameLen = (int32_t)J9UTF8_LENGTH(J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(subMethod)));
 
          printf("class = %.*s superSignature = %.*s, superName = %.*s, supermodifers = %x , subSignature = %.*s, subName = %.*s, submodifiers = %x subMethod = %p methodModifiersAreSafe = %d\n"
                ,classNameLen,classNameChars,superSigLen,superSignature,superNameLen,superName,(int)superROM->modifiers,subSigLen,subSignature,subNameLen,subName,(int)subROM->modifiers,subMethod,methodModifiersAreSafe );
@@ -3368,8 +3390,8 @@ static void updateOverriddenFlag( J9VMThread *vm , J9Class *cl)
                callSignature = J9ROMNAMEANDSIGNATURE_SIGNATURE(nameAndSignature);
                callName = J9ROMNAMEANDSIGNATURE_NAME(nameAndSignature);
 
-               J9UTF8 *superSignature = J9ROMMETHOD_GET_SIGNATURE(J9_CLASS_FROM_METHOD(superMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(superMethod));
-               J9UTF8 *superName = J9ROMMETHOD_GET_NAME(J9_CLASS_FROM_METHOD(superMethod)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(superMethod));
+               J9UTF8 *superSignature = J9ROMMETHOD_SIGNATURE(J9_ROM_METHOD_FROM_RAM_METHOD(superMethod));
+               J9UTF8 *superName = J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(superMethod));
 
                if(   J9UTF8_LENGTH(superSignature) != J9UTF8_LENGTH(callSignature)
                    || J9UTF8_LENGTH(superName) != J9UTF8_LENGTH(callName)
@@ -4009,7 +4031,14 @@ static void jitHookClassLoad(J9HookInterface * * hookInterface, UDATA eventNum, 
    // verify and remove  FIXME
    cl->classDepthAndFlags &= ~J9AccClassHasBeenOverridden;
 
-   J9ClassLoader *classLoader = cl->classLoader;
+   // For regular classes, cl->classLoader points to the correct class loader by the time we enter this hook.
+   // For anonymous classes however, it points to the anonymous class loader and not the correct class loader.
+   // Once the class is fully loaded the classLoader member will be updated to point to the correct class loader,
+   // which is the anonymous class's host class's class loader, but that doesn't do us any good in this hook.
+   // We need the correct class loader right now, so we grab the host class's class loader instead.
+   // For regular classes, cl->hostClass points back to the class itself, so by doing this we get the correct
+   // class loader for both regular and anonymous classes without having to check if this is an anonymous class.
+   J9ClassLoader *classLoader = cl->hostClass->classLoader;
 
    bool p = TR::Options::getVerboseOption(TR_VerboseHookDetailsClassLoading);
    char * className = NULL;
@@ -4666,6 +4695,14 @@ void JitShutdown(J9JITConfig * jitConfig)
 
    if (!vm->isAOT_DEPRECATED_DO_NOT_USE())
       stopSamplingThread(jitConfig);
+
+#if defined(JITSERVER_SUPPORT)
+   JITServerStatisticsThread *statsThreadObj = ((TR_JitPrivateConfig*)(jitConfig->privateConfig))->statisticsThreadObject;
+   if (statsThreadObj)
+      {
+      statsThreadObj->stopStatisticsThread(jitConfig);
+      }
+#endif
 
    TR_DebuggingCounters::report();
    accumulateAndPrintDebugCounters(jitConfig);
@@ -6981,6 +7018,32 @@ int32_t setUpHooks(J9JavaVM * javaVM, J9JITConfig * jitConfig, TR_FrontEnd * vm)
          }
       }
 
+#if defined(JITSERVER_SUPPORT)   
+   if (compInfo->getPersistentInfo()->getRemoteCompilationMode() == JITServer::SERVER)
+      {
+      TR_Listener *listener = ((TR_JitPrivateConfig*)(jitConfig->privateConfig))->listener;
+      listener->startListenerThread(javaVM);
+
+      if (TR::Options::getVerboseOption(TR_VerboseJITServer))
+         TR_VerboseLog::writeLineLocked(TR_Vlog_JITServer, "Started JITServer listener thread: %p ", listener->getListenerThread());
+
+      if (jitConfig->samplingFrequency != 0)
+         {
+         JITServerStatisticsThread *statsThreadObj = ((TR_JitPrivateConfig*)(jitConfig->privateConfig))->statisticsThreadObject;
+         // statsThreadObj is guaranteed to be non-null because JITServer will not start if statisticsThreadObject cannot be created
+         statsThreadObj->startStatisticsThread(javaVM);
+         // Verify that statistics thread was started
+         if (!statsThreadObj->getStatisticsThread())
+            {
+            j9tty_printf(PORTLIB, "Error: Unable to start the statistics thread\n");
+            return -1;
+            // If we decide to start even without a statistics thread, we must
+            // free `statsThreadObj` and set the corresponding jitConfig field to NULL
+            }
+         }
+      }
+#endif // JITSERVER_SUPPORT
+
    if ((*gcOmrHooks)->J9HookRegisterWithCallSite(gcOmrHooks, J9HOOK_MM_OMR_LOCAL_GC_START, jitHookLocalGCStart, OMR_GET_CALLSITE(), NULL) ||
        (*gcOmrHooks)->J9HookRegisterWithCallSite(gcOmrHooks, J9HOOK_MM_OMR_LOCAL_GC_END, jitHookLocalGCEnd, OMR_GET_CALLSITE(), NULL) ||
        (*gcOmrHooks)->J9HookRegisterWithCallSite(gcOmrHooks, J9HOOK_MM_OMR_GLOBAL_GC_START, jitHookGlobalGCStart, OMR_GET_CALLSITE(), NULL) ||
@@ -7099,4 +7162,3 @@ int32_t setUpHooks(J9JavaVM * javaVM, J9JITConfig * jitConfig, TR_FrontEnd * vm)
 
 
 } /* extern "C" */
-

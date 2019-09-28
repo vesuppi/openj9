@@ -44,7 +44,6 @@
 #include "j9protos.h"
 #include "vmaccess.h"
 #include "objhelp.h"
-#include "shcdatatypes.h"
 #include "codegen/CodeGenerator.hpp"
 #include "codegen/Instruction.hpp"
 #include "compile/CompilationTypes.hpp"
@@ -93,13 +92,18 @@
 #include "env/J9SegmentCache.hpp"
 #include "env/SystemSegmentProvider.hpp"
 #include "env/DebugSegmentProvider.hpp"
+#if defined(JITSERVER_SUPPORT)
+#include "control/JITServerHelpers.hpp"
+#include "runtime/JITClientSession.hpp"
+#endif /* defined(JITSERVER_SUPPORT) */
 #ifdef COMPRESS_AOT_DATA
+#include "shcdatatypes.h" // For CompiledMethodWrapper
 #ifdef J9ZOS390
-// inflateInit checks the version of the zlib with which data was deflated. 
+// inflateInit checks the version of the zlib with which data was deflated.
 // Reason we need to avoid conversion here is because, we are statically linking
-// system zlib which would have encoded String literals in some version which is not 
+// system zlib which would have encoded String literals in some version which is not
 // same as the version we are converting out string literals in. This leads to issue
-// where we fail inflating data with version mismatch. 
+// where we fail inflating data with version mismatch.
 #pragma convlit(suspend)
 #include <zlib.h>
 #pragma convlit(resume)
@@ -155,6 +159,20 @@ void setThreadAffinity(unsigned _int64 handle, unsigned long mask)
    }
 #endif
 
+TR_RelocationRuntime*
+TR::CompilationInfoPerThreadBase::reloRuntime()
+   {
+#if defined(JITSERVER_SUPPORT) && defined(JITSERVER_TODO)
+   if (_methodBeingCompiled->isAotLoad() ||
+       _compInfo.getPersistentInfo()->getRemoteCompilationMode() == JITServer::NONE ||
+       (_compInfo.getPersistentInfo()->getRemoteCompilationMode() == JITServer::CLIENT && TR::Options::sharedClassCache())) // Enable local AOT compilations at client
+      return static_cast<TR_RelocationRuntime*>(&_sharedCacheReloRuntime);
+   return static_cast<TR_RelocationRuntime*>(&_remoteCompileReloRuntime);
+#else
+   return static_cast<TR_RelocationRuntime*>(&_sharedCacheReloRuntime);
+#endif /* defined(JITSERVER_SUPPORT) && defined(JITSERVER_TODO) */
+   }
+
 void
 TR::CompilationInfoPerThreadBase::setCompilation(TR::Compilation *compiler)
    {
@@ -182,6 +200,10 @@ blankDumpSignalHandler(struct J9PortLibrary *portLibrary, U_32 gpType, void *gpI
    return J9PORT_SIG_EXCEPTION_RETURN; // FIXME: is this the right return type? - This appears to be the right return type
    }
 #endif
+
+#if defined(JITSERVER_SUPPORT)
+thread_local TR::CompilationInfoPerThread *TR::compInfoPT;
+#endif /* defined(JITSERVER_SUPPORT) */
 
 static UDATA
 jitSignalHandler(struct J9PortLibrary *portLibrary, U_32 gpType, void *gpInfo, void *arg)
@@ -272,21 +294,21 @@ jitSignalHandler(struct J9PortLibrary *portLibrary, U_32 gpType, void *gpInfo, v
  * \brief
  *    Inflates the data buffer using zlib into output buffer
  *
- * \param 
- *    buffer Input buffer that is going to be inflated 
- * 
- * \param 
+ * \param
+ *    buffer Input buffer that is going to be inflated
+ *
+ * \param
  *    numberOfBytes Size of the data in the input buffer to inflate
- * 
+ *
  * \param
  *    outBuffer Output buffer to hold the deflated data
- * 
+ *
  * \param
  *    unCompressedSize Size of the original data
- * 
+ *
  * \return
  *    Returns DECOMPRESSION_FAILED if it can not inflate the buffer
- * 
+ *
  */
 static
 int inflateBuffer(U_8 *buffer, int numberOfBytes, U_8 *outBuffer, int unCompressedSize)
@@ -311,7 +333,7 @@ int inflateBuffer(U_8 *buffer, int numberOfBytes, U_8 *outBuffer, int unCompress
     * ZLIB returns Z_STREAM_END if the buffer stream to be inflated is finished.
     * In this case it returns DECOMPRESSION_FAILED.
     * Caller of this routine can then decide if they want to retry deflating
-    * Using larger output buffer. 
+    * Using larger output buffer.
     */
    if (ret != Z_STREAM_END)
       {
@@ -330,22 +352,22 @@ int inflateBuffer(U_8 *buffer, int numberOfBytes, U_8 *outBuffer, int unCompress
  * \brief
  *    Deflates the data buffer using zlib into output buffer
  *
- * \param 
- *    buffer Input buffer that is going to be deflated 
- * 
- * \param 
+ * \param
+ *    buffer Input buffer that is going to be deflated
+ *
+ * \param
  *    numberOfBytes Size of the data in the input buffer to deflate
- * 
+ *
  * \param
  *    outBuffer Output buffer to hold the deflated data
- * 
+ *
  * \param
  *    level Level of compression
- * 
+ *
  * \return
  *    If successful, returns Size of data in the deflated bufer
  *    else returns COMPRESSION_FAILED
- * 
+ *
  */
 static
 int deflateBuffer(const U_8 *buffer, int numberOfBytes, U_8 *outBuffer, int level)
@@ -367,7 +389,7 @@ int deflateBuffer(const U_8 *buffer, int numberOfBytes, U_8 *outBuffer, int leve
     * ZLIB returns Z_STREAM_END if the buffer stream to be deflated is finished.
     * That Return COMPRESSION_FAILED in case we are ending up inflating the data.
     * Caller of this routine can then decide if they want to retry deflating
-    * Using larger output buffer. 
+    * Using larger output buffer.
     */
    if ( ret != Z_STREAM_END )
       {
@@ -375,7 +397,7 @@ int deflateBuffer(const U_8 *buffer, int numberOfBytes, U_8 *outBuffer, int leve
       deflateEnd(&_stream);
       return COMPRESSION_FAILED;
       }
-   
+
    int compressedSize = numberOfBytes - _stream.avail_out;
    deflateEnd(&_stream);
    return compressedSize;
@@ -743,6 +765,27 @@ void TR::CompilationInfo::freeCompilationInfo(J9JITConfig *jitConfig)
    rawAllocator.deallocate(compilationRuntime);
    }
 
+#if defined(JITSERVER_SUPPORT)
+J9ROMClass *
+TR::CompilationInfoPerThread::getRemoteROMClassIfCached(J9Class *clazz)
+   {
+   return JITServerHelpers::getRemoteROMClassIfCached(getClientData(), clazz);
+   }
+
+J9ROMClass *
+TR::CompilationInfoPerThread::getAndCacheRemoteROMClass(J9Class *clazz, TR_Memory *trMemory)
+   {
+   auto romClass = getRemoteROMClassIfCached(clazz);
+   if (romClass == NULL)
+      {
+      JITServerHelpers::ClassInfoTuple classInfoTuple;
+      romClass = JITServerHelpers::getRemoteROMClass(clazz, getStream(), trMemory ? trMemory : TR::comp()->trMemory(), &classInfoTuple);
+      JITServerHelpers::cacheRemoteROMClass(getClientData(), clazz, romClass, &classInfoTuple);
+      }
+   return romClass;
+   }
+#endif /* defined(JITSERVER_SUPPORT) */
+
 void
 TR::CompilationInfoPerThread::waitForGCCycleMonitor(bool threadHasVMAccess)
    {
@@ -830,7 +873,7 @@ TR::FILE *TR::CompilationInfoPerThreadBase::_perfFile = NULL; // used on Linux f
 TR::CompilationInfoPerThreadBase::CompilationInfoPerThreadBase(TR::CompilationInfo &compInfo, J9JITConfig *jitConfig, int32_t id, bool onSeparateThread) :
    _compInfo(compInfo),
    _jitConfig(jitConfig),
-   _reloRuntime(jitConfig),
+   _sharedCacheReloRuntime(jitConfig),
    _compThreadId(id),
    _onSeparateThread(onSeparateThread),
    _vm(NULL),
@@ -844,6 +887,10 @@ TR::CompilationInfoPerThreadBase::CompilationInfoPerThreadBase(TR::CompilationIn
    _compilationCanBeInterrupted(false),
    _compilationThreadState(COMPTHREAD_UNINITIALIZED),
    _compilationShouldBeInterrupted(false),
+#if defined(JITSERVER_SUPPORT)
+   _cachedClientDataPtr(NULL),
+   _clientStream(NULL),
+#endif /* defined(JITSERVER_SUPPORT) */
    _addToJProfilingQueue(false)
    {
    TR_ASSERT(_compThreadId < MAX_TOTAL_COMP_THREADS, "Cannot have a compId greater than MAX_TOTAL_COMP_THREADS");
@@ -917,11 +964,29 @@ TR::CompilationInfoPerThread::CompilationInfoPerThread(TR::CompilationInfo &comp
    _numJITCompilations = 0;
    _lastTimeThreadWasSuspended = 0;
    _lastTimeThreadWentToSleep = 0;
+
+#if defined(JITSERVER_SUPPORT)
+   if (compInfo.getPersistentInfo()->getRemoteCompilationMode() == JITServer::SERVER)
+      {
+      _classesThatShouldNotBeNewlyExtended = new (PERSISTENT_NEW) PersistentUnorderedSet<TR_OpaqueClassBlock*>(
+         PersistentUnorderedSet<TR_OpaqueClassBlock*>::allocator_type(TR::Compiler->persistentAllocator()));
+      }
+   else
+      {
+      _classesThatShouldNotBeNewlyExtended = NULL;
+      }
+
+   _lastLocalGCCounter = 0;
+#endif /* defined(JITSERVER_SUPPORT) */
    }
 
 TR::CompilationInfo::CompilationInfo(J9JITConfig *jitConfig) :
+#if defined(JITSERVER_SUPPORT)
+   _sslKeys(decltype(_sslKeys)::allocator_type(TR::Compiler->persistentAllocator())),
+   _sslCerts(decltype(_sslCerts)::allocator_type(TR::Compiler->persistentAllocator())),
+#endif /* defined(JITSERVER_SUPPORT) */
    _persistentMemory(pointer_cast<TR_PersistentMemory *>(jitConfig->scratchSegment)),
-   _reloRuntime(jitConfig),
+   _sharedCacheReloRuntime(jitConfig),
    _samplingThreadWaitTimeInDeepIdleToNotifyVM(-1)
    {
    // The object is zero-initialized before this method is called
@@ -1010,6 +1075,15 @@ TR::CompilationInfo::CompilationInfo(J9JITConfig *jitConfig) :
    _lowPriorityCompilationScheduler.setCompInfo(this);
    _JProfilingQueue.setCompInfo(this);
    _interpSamplTrackingInfo = new (PERSISTENT_NEW) TR_InterpreterSamplingTracking(this);
+#if defined(JITSERVER_SUPPORT)
+   _clientSessionHT = NULL; // This will be set later when options are processed
+   _unloadedClassesTempList = NULL;
+   _sequencingMonitor = TR::Monitor::create("JIT-SequencingMonitor");
+   _compReqSeqNo = 0;
+   _newlyExtendedClasses = NULL;
+   _chTableUpdateFlags = 0;
+   _localGCCounter = 0;
+#endif /* defined(JITSERVER_SUPPORT) */
    }
 
 bool TR::CompilationInfo::initializeCompilationOnApplicationThread()
@@ -1331,21 +1405,67 @@ void TR::CompilationInfo::releaseLogMonitor()
    }
 
 uint32_t
-TR::CompilationInfo::getMethodBytecodeSize(J9ROMMethod * romMethod)
+TR::CompilationInfo::getMethodBytecodeSize(const J9ROMMethod * romMethod)
    {
    return (romMethod->bytecodeSizeHigh << 16) + romMethod->bytecodeSizeLow;
    }
 
+#if defined(JITSERVER_SUPPORT)
+JITServer::ServerStream *
+TR::CompilationInfo::getStream()
+   {
+   return (TR::compInfoPT) ? TR::compInfoPT->getStream() : NULL;
+   }
+#endif /* defined(JITSERVER_SUPPORT) */
+
 uint32_t
 TR::CompilationInfo::getMethodBytecodeSize(J9Method* method)
    {
+#if defined(JITSERVER_SUPPORT)
+   if (auto stream = TR::CompilationInfo::getStream())
+      {
+         {
+         ClientSessionData *clientSessionData = TR::compInfoPT->getClientData();
+         OMR::CriticalSection getRemoteROMClass(clientSessionData->getROMMapMonitor());
+         auto it = clientSessionData->getJ9MethodMap().find(method);
+         if (it != clientSessionData->getJ9MethodMap().end())
+            {
+            return getMethodBytecodeSize(it->second._romMethod);
+            }
+         }
+      stream->write(JITServer::MessageType::CompInfo_getMethodBytecodeSize, method);
+      return std::get<0>(stream->read<uint32_t>());
+      }
+#endif /* defined(JITSERVER_SUPPORT) */
    return getMethodBytecodeSize(J9_ROM_METHOD_FROM_RAM_METHOD(method));
    }
 
 bool
-TR::CompilationInfo::isJSR292(J9Method *j9method) // Check to see if the J9AccMethodHasMethodHandleInvokes flag is set
+TR::CompilationInfo::isJSR292(const J9ROMMethod *romMethod)
    {
-   return (_J9ROMMETHOD_J9MODIFIER_IS_SET((J9_ROM_METHOD_FROM_RAM_METHOD(j9method)), J9AccMethodHasMethodHandleInvokes));
+   return (_J9ROMMETHOD_J9MODIFIER_IS_SET(romMethod, J9AccMethodHasMethodHandleInvokes));
+   }
+
+bool
+TR::CompilationInfo::isJSR292(J9Method *j9method)
+   {
+#if defined(JITSERVER_SUPPORT)
+   if (auto stream = TR::CompilationInfo::getStream())
+      {
+         {
+         ClientSessionData *clientSessionData = TR::compInfoPT->getClientData();
+         OMR::CriticalSection getRemoteROMClass(clientSessionData->getROMMapMonitor());
+         auto it = clientSessionData->getJ9MethodMap().find(j9method);
+         if (it != clientSessionData->getJ9MethodMap().end())
+            {
+            return isJSR292(it->second._romMethod);
+            }
+         }
+      stream->write(JITServer::MessageType::CompInfo_isJSR292, j9method);
+      return std::get<0>(stream->read<bool>());
+      }
+#endif /* defined(JITSERVER_SUPPORT) */
+   return isJSR292(J9_ROM_METHOD_FROM_RAM_METHOD(j9method));
    }
 
 #if defined(J9VM_INTERP_AOT_COMPILE_SUPPORT) && defined(J9VM_OPT_SHARED_CLASSES) && (defined(TR_HOST_X86) || defined(TR_HOST_POWER) || defined(TR_HOST_S390) || defined(TR_HOST_ARM))
@@ -1355,25 +1475,6 @@ TR::CompilationInfo::disableAOTCompilations()
       TR::Options::getAOTCmdLineOptions()->setOption(TR_NoStoreAOT, true);
       TR_DataCacheManager::getManager()->startupOver();
       }
-#endif
-
-
-#if defined(J9VM_INTERP_AOT_RUNTIME_SUPPORT) && defined(J9VM_OPT_SHARED_CLASSES) && (defined(TR_HOST_X86) || defined(TR_HOST_POWER) || defined(TR_HOST_S390) || defined(TR_HOST_ARM) || defined(TR_HOST_ARM64))
-
-// Note: this method must be called only when we know that AOT mode for shared classes is enabled !!
-bool TR::CompilationInfo::isRomClassForMethodInSharedCache(J9Method *method, J9JavaVM *javaVM)
-   {
-   J9ROMClass *romClass = J9_CLASS_FROM_METHOD(method)->romClass;
-   return _reloRuntime.isRomClassForMethodInSharedCache(method, javaVM) ? true : false;
-   }
-
-TR_YesNoMaybe TR::CompilationInfo::isMethodInSharedCache(J9Method *method, J9JavaVM *javaVM)
-   {
-   if (isRomClassForMethodInSharedCache(method, javaVM))
-      return TR_maybe;
-   else
-      return TR_no;
-   }
 #endif
 
 // Print the entire qualified name of the given method to the vlog
@@ -1388,6 +1489,16 @@ void TR::CompilationInfo::printMethodNameToVlog(J9Method *method)
    TR_VerboseLog::write("%.*s.%.*s%.*s", J9UTF8_LENGTH(className), (char *) J9UTF8_DATA(className),
                                          J9UTF8_LENGTH(name), (char *) J9UTF8_DATA(name),
                                          J9UTF8_LENGTH(signature), (char *) J9UTF8_DATA(signature));
+   }
+
+void TR::CompilationInfo::printMethodNameToVlog(const J9ROMClass* romClass, const J9ROMMethod* romMethod)
+   {
+   J9UTF8 * className = J9ROMCLASS_CLASSNAME(romClass);
+   J9UTF8 * name = J9ROMMETHOD_NAME(romMethod);
+   J9UTF8 * signature = J9ROMMETHOD_SIGNATURE(romMethod);
+   TR_VerboseLog::write("%.*s.%.*s%.*s", J9UTF8_LENGTH(className), (char *)J9UTF8_DATA(className),
+      J9UTF8_LENGTH(name), (char *)J9UTF8_DATA(name),
+      J9UTF8_LENGTH(signature), (char *)J9UTF8_DATA(signature));
    }
 
 //----------------------- Must hide these in TR::CompilationInfo ------
@@ -1916,9 +2027,6 @@ bool TR::CompilationInfo::shouldRetryCompilation(TR_MethodToBeCompiled *entry, T
       {
       if (entry->_compilationAttemptsLeft > 0)
          {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-         TR_J9SharedCache *sc = (TR_J9SharedCache *) (((TR_J9VMBase *)comp->fej9())->sharedCache());
-#endif
 
          TR_PersistentJittedBodyInfo *bodyInfo;
          switch (entry->_compErrCode)
@@ -1970,39 +2078,27 @@ bool TR::CompilationInfo::shouldRetryCompilation(TR_MethodToBeCompiled *entry, T
                   comp->phaseMemProfiler().DumpSummary(*comp);
                   }
 
-               if (!((TR_J9VMBase *)comp->fej9())->isAOT_DEPRECATED_DO_NOT_USE()
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-                   && sc
-#endif
-                  )
+               if (!((TR_J9VMBase *)comp->fej9())->isAOT_DEPRECATED_DO_NOT_USE())
                   {
-                  switch (entry->_optimizationPlan->getOptLevel())
+                  TR_J9SharedCache *sc = (TR_J9SharedCache *) (((TR_J9VMBase *)comp->fej9())->sharedCache());
+                  if (sc)
                      {
-                     case cold:
-                     case warm:
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-                        sc->addHint(method, TR_HintFailedWarm);
-#else
-                        ((TR_J9VMBase *)comp->fej9())->addSharedCacheHint(method, TR_HintFailedWarm);
-#endif
-                        break;
-                     case hot:
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-                        sc->addHint(method, TR_HintFailedHot);
-#else
-                        ((TR_J9VMBase *)comp->fej9())->addSharedCacheHint(method, TR_HintFailedHot);
-#endif
-                        break;
-                     case scorching:
-                     case veryHot:
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-                        sc->addHint(method, TR_HintFailedScorching);
-#else
-                        ((TR_J9VMBase *)comp->fej9())->addSharedCacheHint(method, TR_HintFailedScorching);
-#endif
-                        break;
-                     default:
-                        break;
+                     switch (entry->_optimizationPlan->getOptLevel())
+                        {
+                        case cold:
+                        case warm:
+                           sc->addHint(method, TR_HintFailedWarm);
+                           break;
+                        case hot:
+                           sc->addHint(method, TR_HintFailedHot);
+                           break;
+                        case scorching:
+                        case veryHot:
+                           sc->addHint(method, TR_HintFailedScorching);
+                           break;
+                        default:
+                           break;
+                        }
                      }
                   }
 
@@ -2708,9 +2804,9 @@ void printAllCounts(J9JavaVM *javaVM)
                J9UTF8 *utf8;
                utf8 = J9ROMCLASS_CLASSNAME(clazz->romClass);
                fprintf(stderr, "%.*s", J9UTF8_LENGTH(utf8), (char *) J9UTF8_DATA(utf8));
-               utf8 = J9ROMMETHOD_GET_NAME(J9_CLASS_FROM_METHOD(method)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(method));
+               utf8 = J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(method));
                fprintf(stderr, ".%.*s", J9UTF8_LENGTH(utf8), (char *) J9UTF8_DATA(utf8));
-               utf8 = J9ROMMETHOD_GET_SIGNATURE(J9_CLASS_FROM_METHOD(method)->romClass, J9_ROM_METHOD_FROM_RAM_METHOD(method));
+               utf8 = J9ROMMETHOD_SIGNATURE(J9_ROM_METHOD_FROM_RAM_METHOD(method));
                fprintf(stderr, "%.*s", J9UTF8_LENGTH(utf8), (char *) J9UTF8_DATA(utf8));
                   */
                intptrj_t count = (intptrj_t) TR::CompilationInfo::getInvocationCount(method);
@@ -2853,17 +2949,17 @@ void TR::CompilationInfo::stopCompilationThreads()
    if (printCompMem)
       {
       int32_t codeCacheAllocated = TR::CodeCacheManager::instance()->getCurrentNumberOfCodeCaches() * _jitConfig->codeCacheKB;
-      fprintf(stderr, "Allocated memory for code cache = %d KB\tLimit = %d KB\n",
+      fprintf(stderr, "Allocated memory for code cache = %d KB\tLimit = %lu KB\n",
          codeCacheAllocated, _jitConfig->codeCacheTotalKB);
 
       TR::CodeCacheManager::instance()->printMccStats();
 
-      fprintf(stderr, "Allocated memory for data cache = %d KB\tLimit = %d KB\n",
+      fprintf(stderr, "Allocated memory for data cache = %d KB\tLimit = %lu KB\n",
          TR_DataCacheManager::getManager()->getTotalSegmentMemoryAllocated()/1024,
           _jitConfig->dataCacheTotalKB);
 
       if (getJProfilerThread())
-         fprintf(stderr, "Allocated memory for profile info = %d KB\n", getJProfilerThread()->getProfileInfoFootprint()/1024);
+         fprintf(stderr, "Allocated memory for profile info = %lu KB\n", getJProfilerThread()->getProfileInfoFootprint()/1024);
       }
 
    static char * printPersistentMem = feGetEnv("TR_PrintPersistentMem");
@@ -3367,6 +3463,14 @@ IDATA J9THREAD_PROC protectedCompilationThreadProc(J9PortLibrary *, TR::Compilat
    //compInfoPT->setCompilationThread(0);
    return 0;
    }
+
+#if defined(JITSERVER_SUPPORT)
+JITServer::ServerStream *
+TR::CompilationInfoPerThread::getStream()
+   {
+   return (_methodBeingCompiled) ? _methodBeingCompiled->_stream : NULL;
+   }
+#endif /* defined(JITSERVER_SUPPORT) */
 
 void
 TR::CompilationInfoPerThread::run()
@@ -5374,7 +5478,7 @@ void *TR::CompilationInfo::compileOnSeparateThread(J9VMThread * vmThread, TR::Il
             if (J9UTF8_LENGTH(className) == 36 &&
                 0==memcmp(utf8Data(className), "com/ibm/rmi/io/FastPathForCollocated", 36))
                {
-               J9UTF8 *utf8 = J9ROMMETHOD_GET_NAME(declaringClazz, J9_ROM_METHOD_FROM_RAM_METHOD(method));
+               J9UTF8 *utf8 = J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(method));
                if (J9UTF8_LENGTH(utf8)==21 &&
                    0==memcmp(J9UTF8_DATA(utf8), "isVMDeepCopySupported", 21))
                   isORB = true;
@@ -5456,7 +5560,6 @@ void *TR::CompilationInfo::compileOnSeparateThread(J9VMThread * vmThread, TR::Il
    // Check to see if we find the method in the shared cache
    // If yes, raise the priority to be processed ahead of other methods
    //
-   J9JavaVM *javaVM = vmThread->javaVM;
 
    if (TR::Options::sharedClassCache() && !TR::Options::getAOTCmdLineOptions()->getOption(TR_NoLoadAOT) && details.isOrdinaryMethod())
       {
@@ -5468,14 +5571,14 @@ void *TR::CompilationInfo::compileOnSeparateThread(J9VMThread * vmThread, TR::Il
          // other JVM added the method to the cache meanwhile. The net effect is that the said
          // method may have its count bumped up and compiled later
          //
-         if (javaVM->sharedClassConfig->existsCachedCodeForROMMethod(vmThread, J9_ROM_METHOD_FROM_RAM_METHOD(method)))
+         if (vmThread->javaVM->sharedClassConfig->existsCachedCodeForROMMethod(vmThread, J9_ROM_METHOD_FROM_RAM_METHOD(method)))
             {
             TR_J9SharedCacheVM *fe = (TR_J9SharedCacheVM *) TR_J9VMBase::get(jitConfig, vmThread, TR_J9VMBase::AOT_VM);
             if (
                static_cast<TR_JitPrivateConfig *>(jitConfig->privateConfig)->aotValidHeader == TR_yes
                || (
                   static_cast<TR_JitPrivateConfig *>(jitConfig->privateConfig)->aotValidHeader == TR_maybe
-                  && _reloRuntime.validateAOTHeader(javaVM, fe, vmThread)
+                  && _sharedCacheReloRuntime.validateAOTHeader(fe, vmThread)
                   )
                )
                {
@@ -5857,7 +5960,7 @@ void *TR::CompilationInfo::compileOnApplicationThread(J9VMThread * vmThread, TR:
             static_cast<TR_JitPrivateConfig *>(jitConfig->privateConfig)->aotValidHeader == TR_yes
             || (
                static_cast<TR_JitPrivateConfig *>(jitConfig->privateConfig)->aotValidHeader == TR_maybe
-               && _reloRuntime.validateAOTHeader(jitConfig->javaVM, fe, vmThread)
+               && _sharedCacheReloRuntime.validateAOTHeader(fe, vmThread)
                )
             )
             {
@@ -6060,7 +6163,7 @@ TR::CompilationInfoPerThreadBase::installAotCachedMethod(
 
          TR_VerboseLog::vlogAcquire();
          TR_VerboseLog::writeLine(TR_Vlog_COMP,"(AOT load) ");
-         _compInfo.printMethodNameToVlog(method);
+         CompilationInfo::printMethodNameToVlog(method);
          TR_VerboseLog::write(" @ " POINTER_PRINTF_FORMAT "-" POINTER_PRINTF_FORMAT, metaData->startPC, metaData->endWarmPC);
          TR_VerboseLog::write(" Q_SZ=%d Q_SZI=%d QW=%d j9m=%p bcsz=%u", _compInfo.getMethodQueueSize(), _compInfo.getNumQueuedFirstTimeCompilations(),
                                 _compInfo.getQueueWeight(), method, _compInfo.getMethodBytecodeSize(method));
@@ -6127,12 +6230,8 @@ TR::CompilationInfoPerThreadBase::installAotCachedMethod(
                if ((options->getInitialBCount() != 0) &&
                    (options->getInitialCount() != 0))
                   {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                   TR_J9SharedCache *sc = (TR_J9SharedCache *) (compiler->fej9()->sharedCache());
                   sc->addHint(method, TR_HintFailedValidation);
-#else
-                  ((TR_J9VMBase *)fe)->addSharedCacheHint(method, TR_HintFailedValidation);
-#endif
                   }
                 break;
             }
@@ -6337,7 +6436,6 @@ TR::CompilationInfoPerThreadBase::generatePerfToolEntry()
 /**
  * @brief TR::CompilationInfoPerThreadBase::preCompilationTasks
  * @param vmThread Pointer to the current J9VMThread (input)
- * @param javaVM Pointer to the J9JavaVM (input)
  * @param entry Pointer to the TR_MethodToBeCompiled entry (input)
  * @param method Pointer to the J9Method (input)
  * @param aotCachedMethod Pointer to a pointer to the AOT code to be relocated (if it exists) (output)
@@ -6352,7 +6450,6 @@ TR::CompilationInfoPerThreadBase::generatePerfToolEntry()
  */
 void
 TR::CompilationInfoPerThreadBase::preCompilationTasks(J9VMThread * vmThread,
-                                                      J9JavaVM *javaVM,
                                                       TR_MethodToBeCompiled *entry,
                                                       J9Method *method,
                                                       const void **aotCachedMethod,
@@ -6401,7 +6498,7 @@ TR::CompilationInfoPerThreadBase::preCompilationTasks(J9VMThread * vmThread,
          if (canRelocateMethod && !entry->_oldStartPC)
             {
             UDATA flags = 0;
-            *aotCachedMethod = javaVM->sharedClassConfig->findCompiledMethodEx1(vmThread, J9_ROM_METHOD_FROM_RAM_METHOD(method), &flags);
+            *aotCachedMethod = vmThread->javaVM->sharedClassConfig->findCompiledMethodEx1(vmThread, J9_ROM_METHOD_FROM_RAM_METHOD(method), &flags);
             if (!(flags & J9SHR_AOT_METHOD_FLAG_INVALIDATED))
                {
 #ifdef COMPRESS_AOT_DATA
@@ -6526,7 +6623,7 @@ TR::CompilationInfoPerThreadBase::preCompilationTasks(J9VMThread * vmThread,
          !TR::CompilationInfo::isCompiled(method) &&
          !entry->isDLTCompile() &&
          !entry->_doNotUseAotCodeFromSharedCache &&
-         reloRuntime->isRomClassForMethodInSharedCache(method, javaVM) &&
+         TR_J9VMBase::get(_jitConfig, vmThread)->sharedCache()->isPointerInSharedCache(J9_CLASS_FROM_METHOD(method)->romClass) &&
          (!TR::Options::getAOTCmdLineOptions()->getOption(TR_AOTCompileOnlyFromBootstrap) ||
            TR_J9VMBase::get(jitConfig, vmThread)->isClassLibraryMethod((TR_OpaqueMethodBlock *)method), true);
 
@@ -6578,7 +6675,7 @@ TR::CompilationInfoPerThreadBase::preCompilationTasks(J9VMThread * vmThread,
             0 == memcmp(utf8Data(className), "com/ibm/rmi/io/FastPathForCollocated", 36)
             )
             {
-            J9UTF8 *utf8 = J9ROMMETHOD_GET_NAME(declaringClazz, J9_ROM_METHOD_FROM_RAM_METHOD(method));
+            J9UTF8 *utf8 = J9ROMMETHOD_NAME(J9_ROM_METHOD_FROM_RAM_METHOD(method));
             if (
                J9UTF8_LENGTH(utf8)==21 &&
                0 == memcmp(J9UTF8_DATA(utf8), "isVMDeepCopySupported", 21)
@@ -6806,7 +6903,7 @@ TR::CompilationInfoPerThreadBase::postCompilationTasks(J9VMThread * vmThread,
             {
             TR_VerboseLog::vlogAcquire();
             TR_VerboseLog::writeLine(TR_Vlog_COMP, "Method ");
-            getCompilationInfo()->printMethodNameToVlog(method);
+            CompilationInfo::printMethodNameToVlog(method);
             TR_VerboseLog::write(" will continue as interpreted");
             TR_VerboseLog::vlogRelease();
             }
@@ -6830,13 +6927,8 @@ TR::CompilationInfoPerThreadBase::postCompilationTasks(J9VMThread * vmThread,
          if (_onSeparateThread && entry->_async &&  // KEN need to pass in onSeparateThread?
          (TR::Options::getAOTCmdLineOptions()->getEnableSCHintFlags() & (TR_HintUpgrade | TR_HintHot | TR_HintScorching)))
             {
-            uint16_t hints =
             // read all hints at once because we may rely on more than just one type
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-               _vm->sharedCache()->getAllEnabledHints(method) & (TR_HintUpgrade | TR_HintHot | TR_HintScorching);
-#else
-               _vm->getAllSharedCacheHints(method) & (TR_HintUpgrade | TR_HintHot | TR_HintScorching);
-#endif
+            uint16_t hints = _vm->sharedCache()->getAllEnabledHints(method) & (TR_HintUpgrade | TR_HintHot | TR_HintScorching);
             // Now let's see if we need to schedule an AOT upgrade
             if (hints)
                {
@@ -6971,7 +7063,6 @@ TR::CompilationInfoPerThreadBase::compile(J9VMThread * vmThread,
       setTimeWhenCompStarted(j9time_usec_clock());
       }
 
-   J9JavaVM *javaVM = vmThread->javaVM;
    TR_MethodMetaData *metaData = NULL;
    void *startPC = NULL;
    const void *aotCachedMethod = NULL;
@@ -6992,7 +7083,7 @@ TR::CompilationInfoPerThreadBase::compile(J9VMThread * vmThread,
 
    try
       {
-      TR::RawAllocator rawAllocator(javaVM);
+      TR::RawAllocator rawAllocator(vmThread->javaVM);
       J9::SystemSegmentProvider defaultSegmentProvider(
          1 << 16,
          (0 != scratchSegmentProvider.getPreferredSegmentSize()) ? scratchSegmentProvider.getPreferredSegmentSize()
@@ -7012,7 +7103,7 @@ TR::CompilationInfoPerThreadBase::compile(J9VMThread * vmThread,
       TR::Region dispatchRegion(regionSegmentProvider, rawAllocator);
       TR_Memory trMemory(*_compInfo.persistentMemory(), dispatchRegion);
 
-      preCompilationTasks(vmThread, javaVM, entry,
+      preCompilationTasks(vmThread, entry,
                           method, &aotCachedMethod, trMemory,
                           canDoRelocatableCompile, eligibleForRelocatableCompile,
                           reloRuntime);
@@ -7174,33 +7265,14 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
    that->setCompilationShouldBeInterrupted(0);
 
    if (that->_methodBeingCompiled->isDLTCompile())
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
       {
       TR_J9SharedCache *sc = (TR_J9SharedCache *) (vm->sharedCache());
       if (sc)
         sc->addHint(that->_methodBeingCompiled->getMethodDetails().getMethod(), TR_HintDLT);
       }
-#else
-      vm->addSharedCacheHint(that->_methodBeingCompiled->getMethodDetails().getMethod(), TR_HintDLT);
-#endif
-
-   if (that->_methodBeingCompiled->_optimizationPlan->isUpgradeRecompilation())
-      {
-      TR_ASSERT(that->_methodBeingCompiled->_oldStartPC, "upgrade recompilations must have some oldstartpc");
-      TR_PersistentJittedBodyInfo *bodyInfo = TR::Recompilation::getJittedBodyInfoFromPC(that->_methodBeingCompiled->_oldStartPC);
-      if (bodyInfo->getIsAotedBody() || bodyInfo->getHotness() <= cold)
-         {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
-         TR_J9SharedCache *sc = (TR_J9SharedCache *) (vm->sharedCache());
-         if (sc)
-            sc->addHint(that->_methodBeingCompiled->getMethodDetails().getMethod(), TR_HintUpgrade);
-#else
-         vm->addSharedCacheHint(that->_methodBeingCompiled->getMethodDetails().getMethod(), TR_HintUpgrade);
-#endif
-         }
-      }
 
    that->setMetadata(NULL);
+
    try
       {
       InterruptibleOperation generatingCompilationObject(*that);
@@ -7221,6 +7293,19 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
       else
          {
          compilee = vm->createResolvedMethod(p->trMemory(), method);
+         }
+
+      if (that->_methodBeingCompiled->_optimizationPlan->isUpgradeRecompilation())
+         {
+         // TR_ASSERT(that->_methodBeingCompiled->_oldStartPC, "upgrade recompilations must have some oldstartpc");
+         // In JITServer mode, it doesn't have to.
+         TR_PersistentJittedBodyInfo *bodyInfo = ((TR_ResolvedJ9Method*)compilee)->getExistingJittedBodyInfo();
+         if (bodyInfo->getIsAotedBody() || bodyInfo->getHotness() <= cold)
+            {
+            TR_J9SharedCache *sc = (TR_J9SharedCache *) (vm->sharedCache());
+            if (sc)
+               sc->addHint(that->_methodBeingCompiled->getMethodDetails().getMethod(), TR_HintUpgrade);
+            }
          }
 
       // See if this method can be compiled and check it against the method
@@ -7312,6 +7397,11 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
             {
             options->setOption(TR_UseSymbolValidationManager);
             options->setOption(TR_DisableKnownObjectTable);
+            }
+         else if (!vm->canUseSymbolValidationManager())
+            {
+            // disable SVM in case it was enabled explicitly with -Xjit:useSymbolValidationManager
+            options->setOption(TR_UseSymbolValidationManager, false);
             }
 
          // Set jitDump specific options
@@ -7719,8 +7809,14 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
             {
             uint64_t proposedScratchMemoryLimit = (uint64_t)TR::Options::getScratchSpaceLimit();
 
-            // Check if the the method to be compiled is a JSR292 method
-            if (TR::CompilationInfo::isJSR292(details.getMethod()))
+#if defined(JITSERVER_SUPPORT)
+            bool isJSR292 = TR::CompilationInfo::getStream() ? false : TR::CompilationInfo::isJSR292(details.getRomMethod());
+#else
+            bool isJSR292 = TR::CompilationInfo::isJSR292(details.getMethod());
+#endif /* defined(JITSERVER_SUPPORT) */
+
+            // Check if the method to be compiled is a JSR292 method
+            if (isJSR292)
                {
                /* Set options */
                compiler->getOptions()->setOption(TR_Server);
@@ -7866,11 +7962,7 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
          if (profileInfo && profileInfo->getCatchCounter() >= TR_CatchBlockProfileInfo::EDOThreshold)
             {
             isEDOCompilation = true;
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
             sc->addHint(method, TR_HintEDO);
-#else
-            fej9->addSharedCacheHint(method, TR_HintEDO);
-#endif
             }
 
          // There is the possibility that a hot/scorching compilation happened outside
@@ -7883,28 +7975,16 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
             if (hotness == hot)
                {
                if (!isEDOCompilation)
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                   sc->addHint(method, TR_HintHot);
-#else
-                  fej9->addSharedCacheHint(method, TR_HintHot);
-#endif
                }
             else if (hotness == scorching)
                {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                sc->addHint(method, TR_HintScorching);
-#else
-               fej9->addSharedCacheHint(method, TR_HintScorching);
-#endif
                }
             // We also want to add a hint about methods compiled (not AOTed) during startup
             // In subsequent runs we should give such method lower counts the idea being
             // that if I take the time to compile method, why not do it sooner
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
             sc->addHint(method, TR_HintMethodCompiledDuringStartup);
-#else
-            fej9->addSharedCacheHint(method, TR_HintMethodCompiledDuringStartup);
-#endif
             }
          }
 
@@ -7920,19 +8000,11 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
             TR_Hotness hotness = that->_methodBeingCompiled->_optimizationPlan->getOptLevel();
             if (hotness <= cold)
                {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                sc->addHint(method, TR_HintLargeMemoryMethodC);
-#else
-               fej9->addSharedCacheHint(method, TR_HintLargeMemoryMethodC);
-#endif
                }
             else if (hotness == warm)
                {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                sc->addHint(method, TR_HintLargeMemoryMethodW);
-#else
-               fej9->addSharedCacheHint(method, TR_HintLargeMemoryMethodW);
-#endif
                }
             }
 
@@ -7941,19 +8013,11 @@ TR::CompilationInfoPerThreadBase::wrappedCompile(J9PortLibrary *portLib, void * 
             TR_Hotness hotness = that->_methodBeingCompiled->_optimizationPlan->getOptLevel();
             if (hotness <= cold)
                {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                sc->addHint(method, TR_HintLargeCompCPUC);
-#else
-               fej9->addSharedCacheHint(method, TR_HintLargeCompCPUC);
-#endif
                }
             else if (hotness == warm)
                {
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                sc->addHint(method, TR_HintLargeCompCPUW);
-#else
-               fej9->addSharedCacheHint(method, TR_HintLargeCompCPUW);
-#endif
                }
             }
          }
@@ -8014,11 +8078,6 @@ TR::CompilationInfoPerThreadBase::compile(
    try
       {
       InterruptibleOperation compilingMethodBody(*this);
-#if defined(J9VM_INTERP_PROFILING_BYTECODES)
-      TR_IProfiler *profiler = vm.getIProfiler();
-      if (profiler)
-         profiler->resetProfiler();
-#endif
 
       TR::IlGeneratorMethodDetails & details = _methodBeingCompiled->getMethodDetails();
       J9Method *method = details.getMethod();
@@ -8487,7 +8546,7 @@ TR::CompilationInfoPerThreadBase::compile(
 
       if (compiler->getOption(TR_BreakAfterCompile))
          {
-         fprintf(stderr, "\n=== Finished compiling %s at %p ===\n", compiler->signature(), compiler->cg()->getCodeStart());
+         fprintf(stderr, "\n=== Finished compiling %s at %p ===\n", compiler->signature(), (void *)metaData->startPC);
          TR::Compiler->debug.breakPoint();
          }
 
@@ -8522,15 +8581,11 @@ TR::CompilationInfoPerThreadBase::compile(
                }
 
             if (!compiler->fej9()->isAOT_DEPRECATED_DO_NOT_USE())
-#if defined(HINTS_IN_SHAREDCACHE_OBJECT)
                {
                TR_J9SharedCache *sc = (TR_J9SharedCache *) (compiler->fej9()->sharedCache());
                if (sc)
                   sc->addHint(compiler->getCurrentMethod(), TR_HintFailedCHTable);
                }
-#else
-               vm.addSharedCacheHint(compiler->getCurrentMethod(), TR_HintFailedCHTable);
-#endif
             compiler->failCompilation<J9::CHTableCommitFailure>("CHTable commit failure");
             }
          }
@@ -9294,7 +9349,7 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                      // If validation has been performed, then a header already existed
                      // or one was already been created in this JVM
                      TR_J9SharedCacheVM *fe = (TR_J9SharedCacheVM *) TR_J9VMBase::get(jitConfig, vmThread, TR_J9VMBase::AOT_VM);
-                     safeToStore = entry->_compInfoPT->reloRuntime()->storeAOTHeader(jitConfig->javaVM, fe, vmThread);
+                     safeToStore = entry->_compInfoPT->reloRuntime()->storeAOTHeader(fe, vmThread);
                      }
                   else
                      {
@@ -9318,7 +9373,7 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                   codeStart = (U_8 *)aotMethodHeaderEntry->compileMethodCodeStartPC;
                   codeSize  = aotMethodHeaderEntry->compileMethodCodeSize;
 
-                  aotMethodHeaderEntry->compileFirstClassLocation = (UDATA)jitConfig->javaVM->sharedClassConfig->cacheDescriptorList->romclassStartAddress;
+                  aotMethodHeaderEntry->unused = TR::Compiler->host.is64Bit() ? 0xDEADC0DEDEADC0DEULL : 0xDEADC0DE;
 
                   if (safeToStore)
                      {
@@ -9327,7 +9382,7 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                      int metadataToStoreSize = dataSize;
                      int codedataToStoreSize = codeSize;
 #ifdef COMPRESS_AOT_DATA
-                     try 
+                     try
                         {
                         if (!comp->getOption(TR_DisableAOTBytesCompression))
                            {
@@ -9336,20 +9391,20 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                             * -----------------------------------------------------------------------------------------------------
                             * | CompiledMethodWrapper | J9JITDataCacheHeader | TR_AOTMethodHeader | Metadata | Compiled Code Data |
                             * -----------------------------------------------------------------------------------------------------
-                            * 
+                            *
                             * When we compile a method, we send data from J9JITDataCacheHeader to store in the cache.
-                            * For each method Shared Class Cache API adds CompiledMethodWrapper header which holds the size of data in cache, 
-                            * as well as J9ROMMethod of compiled method. 
+                            * For each method Shared Class Cache API adds CompiledMethodWrapper header which holds the size of data in cache,
+                            * as well as J9ROMMethod of compiled method.
                             * Size of the original data is extracted from the TR_AOTMethodHeader while size of compressed data is extracted from
-                            * CompiledMethodWrapper. 
-                            * That is why We do not compress header as we can extract the original data size 
-                            * which is useful information while inflating the method data while loading compiled method. 
-                            * 
+                            * CompiledMethodWrapper.
+                            * That is why We do not compress header as we can extract the original data size
+                            * which is useful information while inflating the method data while loading compiled method.
+                            *
                             * Compressed data stored in the cache looks like following
                             * ------------------------------------------------------------------------------------------------------------------------------------------------
                             * | CompiledMethodWrapper | J9JITDataCacheHeader (UnCompressed)| TR_AOTMethodHeader (UnCompressed)| (Metadata + Compiled Code Data) (Compressed) |
                             * ------------------------------------------------------------------------------------------------------------------------------------------------
-                            *  
+                            *
                             */
                            void * originalData = comp->trMemory()->allocateHeapMemory(codeSize+dataSize);
                            void * compressedData = comp->trMemory()->allocateHeapMemory(codeSize+dataSize);
@@ -9366,7 +9421,7 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                                * In load run we get the whole buffer from the cache and use the information from header to
                                * Get the relocation data and compiled code.
                                * Because of this reason we copy both metadata and compiled code in one buffer and deflate it together.
-                               * TODO: We will always query the shared class cache to get full data for stored AOT compiled method 
+                               * TODO: We will always query the shared class cache to get full data for stored AOT compiled method
                                * that is combined meta data and code data. Even if compression of AOT bytes is disabled, we do not need
                                * to send two different buffers to store in cache and also as no one queries either code data / metadata for
                                * method, clean up the share classs cache API.
@@ -9376,7 +9431,7 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                               metadataToStore = (const U_8*) compressedData;
                               metadataToStoreSize = compressedDataSize+aotMethodHeaderSize;
                               codedataToStore = NULL;
-                              codedataToStoreSize = 0;  
+                              codedataToStoreSize = 0;
                               if (TR::Options::getVerboseOption(TR_VerboseAOTCompression))
                                  {
                                  TR_VerboseLog::writeLineLocked(TR_Vlog_AOTCOMPRESSION, "%s : Compression of method data Successful - Original method size = %d bytes, Compressed Method Size = %d bytes",
@@ -9402,8 +9457,8 @@ TR::CompilationInfo::compilationEnd(J9VMThread * vmThread, TR::IlGeneratorMethod
                            {
                            TR_VerboseLog::writeLineLocked(TR_Vlog_AOTCOMPRESSION, "!%s : Method will not be compressed as necessary memory can not be allocated, Method Size = %d bytes",
                               comp->signature(),
-                              dataSize+codeSize);   
-                           }   
+                              dataSize+codeSize);
+                           }
                         }
 #endif
                      switch(
@@ -9822,6 +9877,57 @@ TR::CompilationInfo::setProcessorByDebugOption()
       TR::Compiler->target.cpu.setProcessor(TR_PPC7xx);
    }
 
+#if defined(JITSERVER_SUPPORT)
+void
+TR::CompilationInfo::addJ9HookVMDynamicCodeLoadForAOT(J9VMThread* vmThread, J9Method* method, J9JITConfig* jitConfig, TR_MethodMetaData* relocatedMetaData)
+   {
+   OMR::CodeCacheMethodHeader *ccMethodHeader;
+   ALWAYS_TRIGGER_J9HOOK_VM_DYNAMIC_CODE_LOAD(
+      jitConfig->javaVM->hookInterface,
+      vmThread,
+      method,
+      reinterpret_cast<void *>(relocatedMetaData->startPC),
+      relocatedMetaData->endWarmPC - relocatedMetaData->startPC,
+      "JIT warm body",
+      relocatedMetaData
+      );
+   if (relocatedMetaData->startColdPC)
+      {
+      // Register the cold code section too
+      //
+      ALWAYS_TRIGGER_J9HOOK_VM_DYNAMIC_CODE_LOAD(
+         jitConfig->javaVM->hookInterface,
+         vmThread,
+         method,
+         reinterpret_cast<void *>(relocatedMetaData->startColdPC),
+         relocatedMetaData->endPC - relocatedMetaData->startColdPC,
+         "JIT cold body",
+         relocatedMetaData
+         );
+      }
+   ccMethodHeader = getCodeCacheMethodHeader(
+      reinterpret_cast<char *>(relocatedMetaData->startPC),
+      32,
+      relocatedMetaData
+      );
+   if (ccMethodHeader && (relocatedMetaData->bodyInfo != NULL))
+      {
+      TR_LinkageInfo *linkageInfo = TR_LinkageInfo::get(reinterpret_cast<void *>(relocatedMetaData->startPC));
+      if (linkageInfo->isRecompMethodBody())
+         {
+         ALWAYS_TRIGGER_J9HOOK_VM_DYNAMIC_CODE_LOAD(
+            jitConfig->javaVM->hookInterface,
+            vmThread,
+            method,
+            ccMethodHeader->_eyeCatcher + 4,
+            relocatedMetaData->startPC - reinterpret_cast<uintptr_t>(ccMethodHeader->_eyeCatcher + 4),
+            "JIT method header",
+            relocatedMetaData
+            );
+         }
+      }
+   }
+#endif /* defined(JITSERVER_SUPPORT) */
 
 // Ensure that only methods whose name (prefix) matches names in
 // the translation filter list are compiled.
@@ -10642,7 +10748,7 @@ void TR::CompilationInfo::printCompQueue()
    fprintf(stderr, "\nQueue:");
    for (TR_MethodToBeCompiled *cur = _methodQueue; cur; cur = cur->_next)
       {
-      fprintf(stderr, " %x", cur);
+      fprintf(stderr, " %p", cur);
       }
    fprintf(stderr, "\n");
    }
@@ -10945,7 +11051,207 @@ TR::CompilationInfo::computeFreePhysicalLimitAndAbortCompilationIfLow(TR::Compil
    return freePhysicalMemorySizeB;
    }
 
+#if defined(JITSERVER_SUPPORT)
+#if defined(J9VM_INTERP_AOT_COMPILE_SUPPORT) && defined(J9VM_OPT_SHARED_CLASSES) && (defined(TR_HOST_X86) || defined(TR_HOST_POWER) || defined(TR_HOST_S390) || defined(TR_HOST_ARM))
+void
+TR::CompilationInfo::storeAOTInSharedCache(
+   J9VMThread *vmThread,
+   J9ROMMethod *romMethod,
+   const U_8 *dataStart,
+   UDATA dataSize,
+   const U_8 *codeStart,
+   UDATA codeSize,
+   TR::Compilation *comp,
+   J9JITConfig *jitConfig,
+   TR_MethodToBeCompiled *entry
+   ) 
+   {
+   bool safeToStore;
+   const J9JITDataCacheHeader *storedCompiledMethod = NULL;
+   PORT_ACCESS_FROM_JAVAVM(jitConfig->javaVM);
+   TR::CompilationInfo *compInfo = TR::CompilationInfo::get();
 
+   if (static_cast<TR_JitPrivateConfig *>(jitConfig->privateConfig)->aotValidHeader == TR_yes)
+      {
+      safeToStore = true;
+      }
+   else if (static_cast<TR_JitPrivateConfig *>(jitConfig->privateConfig)->aotValidHeader == TR_maybe)
+      {
+      // If validation has been performed, then a header already existed
+      // or one was already been created in this JVM
+      TR_J9SharedCacheVM *fe = (TR_J9SharedCacheVM *) TR_J9VMBase::get(jitConfig, vmThread, TR_J9VMBase::AOT_VM);
+      safeToStore = entry->_compInfoPT->reloRuntime()->storeAOTHeader(fe, vmThread);
+      }
+   else
+      {
+      safeToStore = false;
+      }
+
+   if (safeToStore)
+      {
+      const U_8 *metadataToStore = dataStart;
+      const U_8 *codedataToStore = codeStart;
+      int metadataToStoreSize = dataSize;
+      int codedataToStoreSize = codeSize;
+#ifdef COMPRESS_AOT_DATA
+      try 
+         {
+         if (!comp->getOption(TR_DisableAOTBytesCompression))
+            {
+            /**
+             * For each compiled method data we store in the shareclass cache looks like following.
+             * -----------------------------------------------------------------------------------------------------
+             * | CompiledMethodWrapper | J9JITDataCacheHeader | TR_AOTMethodHeader | Metadata | Compiled Code Data |
+             * -----------------------------------------------------------------------------------------------------
+             * 
+             * When we compile a method, we send data from J9JITDataCacheHeader to store in the cache.
+             * For each method Shared Class Cache API adds CompiledMethodWrapper header which holds the size of data in cache, 
+             * as well as J9ROMMethod of compiled method. 
+             * Size of the original data is extracted from the TR_AOTMethodHeader while size of compressed data is extracted from
+             * CompiledMethodWrapper. 
+             * That is why We do not compress header as we can extract the original data size 
+             * which is useful information while inflating the method data while loading compiled method. 
+             * 
+             * Compressed data stored in the cache looks like following
+             * ------------------------------------------------------------------------------------------------------------------------------------------------
+             * | CompiledMethodWrapper | J9JITDataCacheHeader (UnCompressed)| TR_AOTMethodHeader (UnCompressed)| (Metadata + Compiled Code Data) (Compressed) |
+             * ------------------------------------------------------------------------------------------------------------------------------------------------
+             *  
+             */
+            void * originalData = comp->trMemory()->allocateHeapMemory(codeSize+dataSize);
+            void * compressedData = comp->trMemory()->allocateHeapMemory(codeSize+dataSize);
+
+            // Copy the metadata and codedata combined into single buffer so that we can compress it together
+            memcpy(originalData, dataStart, dataSize);
+            memcpy((U_8*)(originalData)+dataSize, codeStart, codeSize);
+            int aotMethodHeaderSize = sizeof(J9JITDataCacheHeader)+sizeof(TR_AOTMethodHeader);
+            int compressedDataSize = deflateBuffer((U_8*)(originalData)+aotMethodHeaderSize, dataSize+codeSize-aotMethodHeaderSize, (U_8*)(compressedData)+aotMethodHeaderSize, Z_DEFAULT_COMPRESSION);
+            if (compressedDataSize != COMPRESSION_FAILED)
+               {
+               /**
+                * We are going to store both metadata and code in contiguous memory in shared class cache.
+                * In load run we get the whole buffer from the cache and use the information from header to
+                * Get the relocation data and compiled code.
+                * Because of this reason we copy both metadata and compiled code in one buffer and deflate it together.
+                * TODO: We will always query the shared class cache to get full data for stored AOT compiled method 
+                * that is combined meta data and code data. Even if compression of AOT bytes is disabled, we do not need
+                * to send two different buffers to store in cache and also as no one queries either code data / metadata for
+                * method, clean up the share classs cache API.
+                */
+               const J9JITDataCacheHeader *aotMethodHeader = reinterpret_cast<const J9JITDataCacheHeader *>(dataStart);
+               TR_AOTMethodHeader *aotMethodHeaderEntry = const_cast<TR_AOTMethodHeader *>(reinterpret_cast<const TR_AOTMethodHeader *>(aotMethodHeader + 1));
+               aotMethodHeaderEntry->flags |= TR_AOTMethodHeader_CompressedMethodInCache;
+               memcpy(compressedData, dataStart, aotMethodHeaderSize);
+               metadataToStore = (const U_8*) compressedData;
+               metadataToStoreSize = compressedDataSize+aotMethodHeaderSize;
+               codedataToStore = NULL;
+               codedataToStoreSize = 0;  
+               if (TR::Options::getVerboseOption(TR_VerboseAOTCompression))
+                  {
+                  TR_VerboseLog::writeLineLocked(TR_Vlog_AOTCOMPRESSION, "%s : Compression of method data Successful - Original method size = %d bytes, Compressed Method Size = %d bytes",
+                     comp->signature(),
+                     dataSize+codeSize, metadataToStoreSize);
+                  }
+               }
+            else
+               {
+               if (TR::Options::getVerboseOption(TR_VerboseAOTCompression))
+                  {
+                  TR_VerboseLog::writeLineLocked(TR_Vlog_AOTCOMPRESSION, "!%s : Compression of method data Failed - Original method size = %d bytes",
+                     comp->signature(),
+                     dataSize+codeSize);
+                  }
+               }
+            }
+         }
+      catch (const std::bad_alloc &allocationFailure)
+         {
+         // In case we can not allocate extra memory to hold temp data for compressing, we still the uncompressed data into the cache
+         if (TR::Options::getVerboseOption(TR_VerboseAOTCompression))
+            {
+            TR_VerboseLog::writeLineLocked(TR_Vlog_AOTCOMPRESSION, "!%s : Method will not be compressed as necessary memory can not be allocated, Method Size = %d bytes",
+               comp->signature(),
+               dataSize+codeSize);   
+            }   
+         }
+#endif
+      storedCompiledMethod =
+         reinterpret_cast<const J9JITDataCacheHeader*>(
+            jitConfig->javaVM->sharedClassConfig->storeCompiledMethod(
+               vmThread,
+               romMethod,
+               (const U_8*)metadataToStore,
+               metadataToStoreSize,
+               (const U_8*)codedataToStore,
+               codedataToStoreSize,
+               0));
+      switch(reinterpret_cast<uintptr_t>(storedCompiledMethod))
+         {
+         case J9SHR_RESOURCE_STORE_FULL:
+            {
+            if (jitConfig->javaVM->sharedClassConfig->verboseFlags & J9SHR_VERBOSEFLAG_ENABLE_VERBOSE)
+               j9nls_printf( PORTLIB, J9NLS_WARNING,  J9NLS_RELOCATABLE_CODE_STORE_FULL);
+            TR_J9SharedCache::setSharedCacheDisabledReason(TR_J9SharedCache::SHARED_CACHE_FULL);
+            disableAOTCompilations();
+            }
+            break;
+         case J9SHR_RESOURCE_STORE_ERROR:
+            {
+            if (jitConfig->javaVM->sharedClassConfig->verboseFlags & J9SHR_VERBOSEFLAG_ENABLE_VERBOSE)
+               j9nls_printf( PORTLIB, J9NLS_WARNING,  J9NLS_RELOCATABLE_CODE_STORE_ERROR);
+            TR_J9SharedCache::setSharedCacheDisabledReason(TR_J9SharedCache::SHARED_CACHE_STORE_ERROR);
+            TR::Options::getAOTCmdLineOptions()->setOption(TR_NoLoadAOT);
+            disableAOTCompilations();
+            }
+         }
+      }
+   else
+      {
+      if (TR::Options::getAOTCmdLineOptions()->getVerboseOption(TR_VerboseCompileEnd))
+         {
+         PORT_ACCESS_FROM_JAVAVM(jitConfig->javaVM);
+         TR_VerboseLog::writeLineLocked(TR_Vlog_FAILURE, " Failed AOT cache validation");
+         }
+
+      disableAOTCompilations();
+      }
+   }
+#endif
+
+void
+TR::CompilationInfo::replenishInvocationCount(J9Method* method, TR::Compilation* comp)
+   {
+   // Replenish the counts of the method
+   // We are holding the compilation monitor at this point
+   //
+   J9ROMMethod *romMethod = J9_ROM_METHOD_FROM_RAM_METHOD(method);
+   if (!(romMethod->modifiers & J9AccNative))// Never change the extra field of a native method
+      {
+      int32_t methodVMExtra = TR::CompilationInfo::getJ9MethodVMExtra(method);
+      if (methodVMExtra == 1 || methodVMExtra == J9_JIT_QUEUED_FOR_COMPILATION)
+         {
+         // We want to use high counts unless the user specified counts on the command line
+         // or he used useLowerMethodCounts (or Xquickstart)
+         int32_t count;
+         if (TR::Options::getCountsAreProvidedByUser() || TR::Options::startupTimeMatters() == TR_yes)
+            count = getCount(romMethod, comp->getOptions(), comp->getOptions());
+         else
+            count = J9ROMMETHOD_HAS_BACKWARDS_BRANCHES(romMethod) ? TR_DEFAULT_INITIAL_BCOUNT : TR_DEFAULT_INITIAL_COUNT;
+
+         TR::CompilationInfo::setInvocationCount(method, count);
+         if (TR::Options::getCmdLineOptions()->getVerboseOption(TR_VerbosePerformance))
+            {
+            // compiler must exist because startPC != NULL
+            TR_VerboseLog::writeLineLocked(TR_Vlog_PERF, "Reencoding count=%d for %s j9m=%p ", count, comp->signature(), method);
+            }
+         }
+      else
+         {
+         TR_ASSERT(false, "Unexpected value for method->extra = %p (method=%p)\n", TR::CompilationInfo::getJ9MethodExtra(method), method);
+         }
+      }
+   }
+#endif /* defined(JITSERVER_SUPPORT) */
 
 //===========================================================
 TR_LowPriorityCompQueue::TR_LowPriorityCompQueue()
@@ -11900,3 +12206,84 @@ bool TR::CompilationInfo::canProcessJProfilingRequest()
       return true;
       }
    }
+
+#if defined(JITSERVER_SUPPORT)
+void
+TR::CompilationInfoPerThread::updateLastLocalGCCounter()
+   {
+   _lastLocalGCCounter = getCompilationInfo()->getLocalGCCounter();
+   }
+
+// This method is executed by the JITServer to queue a placeholder for
+// a compilation request received from the client. At the time the new
+// entry is queued we do not know any details about the compilation request.
+// The method needs to be executed with compilation monitor in hand.
+TR_MethodToBeCompiled *
+TR::CompilationInfo::addOutOfProcessMethodToBeCompiled(JITServer::ServerStream *stream)
+   {
+   TR_MethodToBeCompiled *entry = getCompilationQueueEntry(); // Allocate a new entry
+   if (entry)
+      {
+      // Initialize the entry with defaults (some, like methodDetails, are bogus)
+      TR::IlGeneratorMethodDetails details;
+      entry->initialize(details, NULL, CP_SYNC_NORMAL, NULL);
+      entry->_entryTime = getPersistentInfo()->getElapsedTime(); // Cheaper version
+      entry->_stream = stream; // Add the stream to the entry
+      incrementMethodQueueSize(); // One more method added to the queue
+      _numQueuedFirstTimeCompilations++; // Otherwise an assert triggers when we dequeue
+      queueEntry(entry);
+
+      // Determine whether we need to activate another compilation thread from the pool
+      TR_YesNoMaybe activate = TR_maybe;
+      if (getNumCompThreadsActive() <= 0)
+         {
+         activate = TR_yes;
+         }
+      else if (getNumCompThreadsJobless() > 0)
+         {
+         activate = TR_no; // Just wake the jobless one
+         }
+      else
+         {
+         int32_t numCompThreadsSuspended = getNumUsableCompilationThreads() - getNumCompThreadsActive();
+         TR_ASSERT(numCompThreadsSuspended >= 0, "Accounting error for suspendedCompThreads usable=%d active=%d\n",
+                   getNumUsableCompilationThreads(), getNumCompThreadsActive());
+         // Cannot activate if there is nothing to activate
+         activate = (numCompThreadsSuspended <= 0) ? TR_no : TR_yes;
+         }
+
+      if (activate == TR_yes)
+         {
+         // Must find one that is SUSPENDED/SUSPENDING
+         TR::CompilationInfoPerThread *compInfoPT = getFirstSuspendedCompilationThread();
+         if (compInfoPT)
+            {
+            compInfoPT->resumeCompilationThread();
+            if (TR::Options::getCmdLineOptions()->getVerboseOption(TR_VerboseCompilationThreads))
+               {
+               TR_VerboseLog::writeLineLocked(TR_Vlog_INFO, "t=%6u Activate compThread %d Qweight=%d active=%d",
+                  (uint32_t)getPersistentInfo()->getElapsedTime(), compInfoPT->getCompThreadId(), getQueueWeight(), getNumCompThreadsActive());
+               }
+            }
+         }
+      }
+   return entry;
+   }
+
+void
+TR::CompilationInfo::requeueOutOfProcessEntry(TR_MethodToBeCompiled *entry)
+   {
+   TR_ASSERT(getPersistentInfo()->getRemoteCompilationMode() == JITServer::SERVER, "Should be called in JITServer server mode only");
+
+   recycleCompilationEntry(entry);
+   // we do not requeue outOfProcessEntry for the Per-Compilation-Connection Mode
+   if (feGetEnv("TR_EnableJITServerPerCompConn"))
+      return;
+
+   if (entry->_stream && addOutOfProcessMethodToBeCompiled(entry->_stream))
+      {
+      // successfully queued the new entry, so notify a thread
+      getCompilationMonitor()->notifyAll();
+      }
+   }
+#endif /* defined(JITSERVER_SUPPORT) */

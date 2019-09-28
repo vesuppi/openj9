@@ -37,7 +37,7 @@ import openj9.tools.attach.diagnostics.base.DiagnosticProperties;
 import openj9.tools.attach.diagnostics.base.DiagnosticUtils;
 
 /**
- * JStack 
+ * JStack
  * A tool for listing thread information about another Java process
  *
  */
@@ -78,25 +78,14 @@ public class Jstack {
 
 				if (printProperties) {
 					out.println("System properties:"); //$NON-NLS-1$
-					out.println(diagProvider.getSystemProperties());
+					Util.printProperties(out, diagProvider.getSystemProperties());
+					out.println();
 					out.println("Agent properties:"); //$NON-NLS-1$
-					out.println(diagProvider.getAgentProperties());
+					Util.printProperties(out, diagProvider.getAgentProperties());
+					out.println();
 				}
 			} catch (Exception e) {
-				System.err.printf("Error getting data from %s", vmid); //$NON-NLS-1$
-				final String msg = e.getMessage();
-				if (null == msg) {
-					System.err.println();
-				} else {
-					if (msg.matches(IPC.INCOMPATIBLE_JAVA_VERSION)) {
-						System.err.println(": incompatible target JVM"); //$NON-NLS-1$
-					} else {
-						System.err.printf(": %s%n", msg); //$NON-NLS-1$
-					}
-				}
-				if (DiagnosticProperties.isDebug) {
-					e.printStackTrace();
-				}
+				Util.handleCommandException(vmid, e);
 			} finally {
 				try {
 					diagProvider.detach();
@@ -112,7 +101,7 @@ public class Jstack {
 		boolean okay = true;
 		printProperties = DiagnosticProperties.isDebug;
 		printSynchronizers = false;
-		final String HELPTEXT = "jstack: listing thread information about another Java process%n"
+		final String HELPTEXT = "jstack: list thread information about another Java process%n"
 				+ " Usage:%n"
 				+ "    jstack <vmid>*%n"
 				+ "        <vmid>: Attach API VM ID as shown in jps or other Attach API-based tools%n"

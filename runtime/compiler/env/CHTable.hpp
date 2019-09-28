@@ -33,6 +33,9 @@
 #include "env/jittypes.h"
 #include "infra/Link.hpp"
 #include "runtime/RuntimeAssumptions.hpp"
+#if defined(JITSERVER_SUPPORT)
+#include "env/JITServerCHTable.hpp"
+#endif
 
 class TR_FrontEnd;
 class TR_OpaqueClassBlock;
@@ -127,10 +130,13 @@ class TR_PatchNOPedGuardSiteOnClassPreInitialize : public TR::PatchNOPedGuardSit
       TR_FrontEnd *fe, TR_PersistentMemory *, char *sig, uint32_t sigLen, uint8_t *loc, uint8_t *dest, OMR::RuntimeAssumption **sentinel);
    static uintptrj_t hashCode(char *sig, uint32_t sigLen);
 
-   virtual void reclaim() { jitPersistentFree((void*)_key); }
+   /** \copydoc OMR::RuntimeAssumption::reclaim()
+    *     See base class documentation for more details.
+    */
+   virtual void reclaim();
+
    virtual bool matches(uintptrj_t key) { return false; }
    virtual bool matches(char *sig, uint32_t sigLen);
-   virtual void compensate(TR_FrontEnd *vm, bool isSMP, void *data);
    virtual uintptrj_t hashCode() { return hashCode((char*)getKey(), _sigLen); }
    virtual TR_RuntimeAssumptionKind getAssumptionKind() { return RuntimeAssumptionOnClassPreInitialize; }
 
@@ -411,6 +417,9 @@ class TR_CHTable
    void commitVirtualGuard(TR_VirtualGuard *info, List<TR_VirtualGuardSite> &sites,
                            TR_PersistentCHTable *table, TR::Compilation *comp);
    void commitOSRVirtualGuards(TR::Compilation *comp, TR::list<TR_VirtualGuard*> &vguards);
+#if defined(JITSERVER_SUPPORT)
+   CHTableCommitData computeDataForCHTableCommit(TR::Compilation *comp);
+#endif
 
    TR_Array<TR_OpaqueClassBlock *> *getClasses() { return _classes;}
    TR_Array<TR_OpaqueClassBlock *> *getClassesThatShouldNotBeNewlyExtended() { return _classesThatShouldNotBeNewlyExtended;}

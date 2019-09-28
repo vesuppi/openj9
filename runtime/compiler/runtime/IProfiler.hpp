@@ -24,47 +24,48 @@
 #define IPROFILER_HPP
 
 /**
- * \page Iprofiling Interpreter Profiling 
- * 
- * The Interpreter Profiler, or IProfiler, is a mechanism created to extract 
- * knowledge from the interpreter to feed into our first compilation. 
+ * \page Iprofiling Interpreter Profiling
  *
- * Structurally, the IProfiler consists of three main components: 
+ * The Interpreter Profiler, or IProfiler, is a mechanism created to extract
+ * knowledge from the interpreter to feed into our first compilation.
+ *
+ * Structurally, the IProfiler consists of three main components:
  *
  * - The Interpreter / Virtual Machine which creates the data. The creation
- *   of data is not free however, and so this data collection should be 
- *   possible to disable. 
- * - The IProfiler component consumes the raw data from the VM, parsing it 
- *   into a form consumable in the JIT compiler. 
- * - The JIT compiler, which consumes the data produced by the IProfiler 
- *   and may also query the IProfiler for specific data. 
- *   
- * Below is a rough diagram of the IProfiler system. 
- * 
- * 
- *             Control            Queries          
- *          +-----------+       +-------- --+      
- *          |           |       |           |      
- *          |           |       |           |      
+ *   of data is not free however, and so this data collection should be
+ *   possible to disable.
+ * - The IProfiler component consumes the raw data from the VM, parsing it
+ *   into a form consumable in the JIT compiler.
+ * - The JIT compiler, which consumes the data produced by the IProfiler
+ *   and may also query the IProfiler for specific data.
+ *
+ * Below is a rough diagram of the IProfiler system.
+ *
+ *
+ *             Control            Queries
+ *          +-----------+       +-------- --+
+ *          |           |       |           |
+ *          |           |       |           |
  *     +----v-+       +-+-------v-+        ++-----+
  *     |      |       |           |        |      |
  *     | VM   |       | IProfiler |        | JIT  |
  *     |      |       |           |        |      |
  *     +----+-+       +-^-------+-+        +^-----+
- *          |           |       |           |      
- *          +-----------+       +-----------+      
- *            Raw Data            Processed       
- *                                  Data          
+ *          |           |       |           |
+ *          +-----------+       +-----------+
+ *            Raw Data            Processed
+ *                                  Data
  *
  *
  * For further details see "Experiences in Designing a Robust and Scalable
  * Interpreter Profiling Framework" by Ian Gartley, Marius Pirvu, Vijay
- * Sundaresan and Nikola Grecvski, published in *Code Generation and Optimization (CGO)*, 2013. 
+ * Sundaresan and Nikola Grecvski, published in *Code Generation and Optimization (CGO)*, 2013.
  */
 
 #include "j9.h"
 #include "j9cfg.h"
 #include "env/jittypes.h"
+#include "il/Node.hpp"
 #include "infra/Link.hpp"
 #include "runtime/ExternalProfiler.hpp"
 
@@ -86,6 +87,13 @@ namespace TR { class PersistentInfo; }
 namespace TR { class Monitor; }
 struct J9Class;
 struct J9PortLibrary;
+namespace TR { class ResolvedMethodSymbol; }
+class TR_ResolvedMethod;
+class TR_AbstractInfo;
+class TR_BitVector;
+class TR_J9VMBase;
+class TR_J9SharedCache;
+
 
 #if defined (_MSC_VER)
 extern "C" __declspec(dllimport) void __stdcall DebugBreak();
@@ -130,6 +138,7 @@ public:
 
    uintptrj_t getClazz(int index);
    void setClazz(int index, uintptrj_t clazzPtr);
+   uintptrj_t getDominantClass(int32_t &sumW, int32_t &maxW);
 
 private:
 #if defined(OMR_GC_COMPRESSED_POINTERS) //compressed references
@@ -180,7 +189,6 @@ enum TR_EntryStatusInfo
    IPBC_ENTRY_PERSIST_UNLOADED
    };
 
-
 #define TR_IPBC_PERSISTENT_ENTRY_READ  0x1 // used to check if the persistent entry has been read, if so we want to avoid the overhead introduced by calculating sample counts
 
 // Hash table for bytecodes
@@ -190,7 +198,7 @@ public:
    TR_PERSISTENT_ALLOC(TR_Memory::IProfiler)
    static void* alignedPersistentAlloc(size_t size);
    TR_IPBytecodeHashTableEntry(uintptrj_t pc) : _next(NULL), _pc(pc), _lastSeenClassUnloadID(-1), _entryFlags(0), _persistFlags(IPBC_ENTRY_CAN_PERSIST_FLAG) {}
-    
+
    uintptrj_t getPC() const { return _pc; }
    TR_IPBytecodeHashTableEntry * getNext() const { return _next; }
    void setNext(TR_IPBytecodeHashTableEntry *n) { _next = n; }
@@ -208,11 +216,19 @@ public:
    virtual TR_IPBCDataCallGraph      *asIPBCDataCallGraph()      { return NULL; }
    virtual TR_IPBCDataAllocation     *asIPBCDataAllocation()     { return NULL; }
    // returns the number of bytes the equivalent storage structure needs
-   virtual uint32_t                   getBytesFootprint() = 0; 
+   virtual uint32_t                   getBytesFootprint() = 0;
 
-   virtual uint32_t canBePersisted(uintptrj_t cacheStartAddress, uintptrj_t cacheSize, TR::PersistentInfo *info) { return IPBC_ENTRY_CAN_PERSIST; }
-   virtual void createPersistentCopy(uintptrj_t cacheStartAddress, uintptrj_t cacheSize, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info)  = 0;
-   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader * storage, TR::Compilation *comp, uintptrj_t cacheStartAddress) {}
+#if defined(JITSERVER_SUPPORT)
+   // Serialization used for JITServer
+   // not sufficient for persisting to the shared cache
+   virtual uint32_t canBeSerialized(TR::PersistentInfo *info) { return IPBC_ENTRY_CAN_PERSIST; }
+   virtual void serialize(uintptrj_t methodStartAddress, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info) = 0;
+   virtual void deserialize(TR_IPBCDataStorageHeader *storage) = 0;
+#endif
+
+   virtual uint32_t canBePersisted(TR_J9SharedCache *sharedCache, TR::PersistentInfo *info) { return IPBC_ENTRY_CAN_PERSIST; }
+   virtual void createPersistentCopy(TR_J9SharedCache *sharedCache, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info)  = 0;
+   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader *storage, TR::Compilation *comp) {}
    virtual void copyFromEntry(TR_IPBytecodeHashTableEntry * originalEntry, TR::Compilation *comp) {}
    void clearEntryFlags(){ _entryFlags = 0;};
    void setPersistentEntryRead(){ _entryFlags |= TR_IPBC_PERSISTENT_ENTRY_READ;};
@@ -248,6 +264,7 @@ class TR_IPMethodData
    void setMethod (TR_OpaqueMethodBlock *meth) { _method = meth; }
    uint32_t getWeight() { return _weight; }
    void     incWeight() { ++_weight; }
+   void     setWeight(uint32_t weight) { _weight = weight; }
    uint32_t getPCIndex() { return _pcIndex; }
    void     setPCIndex(uint32_t i) { _pcIndex = i; }
 
@@ -280,7 +297,7 @@ struct TR_IPMethodHashTableEntry
    TR_OpaqueMethodBlock      *_method; // callee
    TR_IPMethodData            _caller; // link list of callers and their weights. Capped at MAX_IPMETHOD_CALLERS
    TR_DummyBucket             _otherBucket;
-    
+
    void add(TR_OpaqueMethodBlock *caller, TR_OpaqueMethodBlock *callee, uint32_t pcIndex);
    };
 
@@ -288,7 +305,7 @@ class TR_IPBCDataFourBytes : public TR_IPBytecodeHashTableEntry
    {
 public:
    TR_PERSISTENT_ALLOC(TR_Memory::IPBCDataFourBytes)
-   TR_IPBCDataFourBytes(uintptrj_t pc) : TR_IPBytecodeHashTableEntry(pc), data(0) {} 
+   TR_IPBCDataFourBytes(uintptrj_t pc) : TR_IPBytecodeHashTableEntry(pc), data(0) {}
    void * operator new (size_t size) throw();
    void * operator new (size_t size, void * placement) {return placement;}
    static const uint32_t IPROFILING_INVALID = ~0;
@@ -301,9 +318,12 @@ public:
    virtual void setInvalid() { data = IPROFILING_INVALID; }
    virtual TR_IPBCDataFourBytes  *asIPBCDataFourBytes() { return this; }
    virtual uint32_t getBytesFootprint() {return sizeof (TR_IPBCDataFourBytesStorage);}
-
-   virtual void createPersistentCopy(uintptrj_t cacheStartAddress, uintptrj_t cacheSize, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
-   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader * storage, TR::Compilation *comp, uintptrj_t cacheStartAddress);
+#if defined(JITSERVER_SUPPORT)
+   virtual void serialize(uintptrj_t methodStartAddress, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
+   virtual void deserialize(TR_IPBCDataStorageHeader *storage);
+#endif
+   virtual void createPersistentCopy(TR_J9SharedCache *sharedCache, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
+   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader *storage, TR::Compilation *comp);
    int16_t getSumBranchCount();
    virtual void copyFromEntry(TR_IPBytecodeHashTableEntry * originalEntry, TR::Compilation *comp);
 private:
@@ -314,7 +334,7 @@ class TR_IPBCDataAllocation : public TR_IPBytecodeHashTableEntry
    {
 public:
    TR_PERSISTENT_ALLOC(TR_Memory::IPBCDataAllocation)
-   TR_IPBCDataAllocation(uintptrj_t pc) : TR_IPBytecodeHashTableEntry(pc), clazz(0), method(0), data(0) {}  
+   TR_IPBCDataAllocation(uintptrj_t pc) : TR_IPBytecodeHashTableEntry(pc), clazz(0), method(0), data(0) {}
    void * operator new (size_t size) throw();
    static const uint32_t IPROFILING_INVALID = ~0;
    virtual uintptrj_t getData(TR::Compilation *comp = NULL) { return (uint32_t)data; }
@@ -356,9 +376,12 @@ public:
    virtual void setInvalid() { data[0] = IPROFILING_INVALID; }
    virtual TR_IPBCDataEightWords  *asIPBCDataEightWords() { return this; }
    virtual uint32_t getBytesFootprint() {return sizeof(TR_IPBCDataEightWordsStorage);}
-
-   virtual void createPersistentCopy(uintptrj_t cacheStartAddress, uintptrj_t cacheSize, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
-   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader * storage, TR::Compilation *comp, uintptrj_t cacheStartAddress);
+#if defined(JITSERVER_SUPPORT)
+   virtual void serialize(uintptrj_t methodStartAddress, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
+   virtual void deserialize(TR_IPBCDataStorageHeader *storage);
+#endif
+   virtual void createPersistentCopy(TR_J9SharedCache *sharedCache, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
+   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader *storage, TR::Compilation *comp);
    virtual int32_t getSumSwitchCount();
    virtual void copyFromEntry(TR_IPBytecodeHashTableEntry * originalEntry, TR::Compilation *comp);
 
@@ -404,9 +427,15 @@ public:
    virtual void setInvalid() { _csInfo.setClazz(0, IPROFILING_INVALID); }
    virtual uint32_t getBytesFootprint() {return sizeof (TR_IPBCDataCallGraphStorage);}
 
-   virtual uint32_t canBePersisted(uintptrj_t cacheStartAddress, uintptrj_t cacheSize, TR::PersistentInfo *info);
-   virtual void createPersistentCopy(uintptrj_t cacheStartAddress, uintptrj_t cacheSize, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
-   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader * storage, TR::Compilation *comp, uintptrj_t cacheStartAddress);
+#if defined(JITSERVER_SUPPORT)
+   virtual uint32_t canBeSerialized(TR::PersistentInfo *info);
+   virtual void serialize(uintptrj_t methodStartAddress, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
+   virtual void deserialize(TR_IPBCDataStorageHeader *storage);
+#endif
+
+   virtual uint32_t canBePersisted(TR_J9SharedCache *sharedCache, TR::PersistentInfo *info);
+   virtual void createPersistentCopy(TR_J9SharedCache *sharedCache, TR_IPBCDataStorageHeader *storage, TR::PersistentInfo *info);
+   virtual void loadFromPersistentCopy(TR_IPBCDataStorageHeader *storage, TR::Compilation *comp);
    virtual void copyFromEntry(TR_IPBytecodeHashTableEntry * originalEntry, TR::Compilation *comp);
 
    bool lockEntry();
@@ -480,7 +509,6 @@ public:
    void shutdown();
    void outputStats();
    void dumpIPBCDataCallGraph(J9VMThread* currentThread);
-   void resetProfiler();
    void startIProfilerThread(J9JavaVM *javaVM);
    void deallocateIProfilerBuffers();
    void stopIProfilerThread();
@@ -496,16 +524,17 @@ public:
    void setWarmCallGraphTooBig(TR_OpaqueMethodBlock *method, int32_t bcIndex, TR::Compilation *comp, bool set = true);
 
    // This method is used to search the hash table first, then the shared cache. Added to support RI data >> public.
-   TR_IPBytecodeHashTableEntry *profilingSampleRI (uintptrj_t pc, uintptrj_t data, bool addIt, uint32_t freq);   
-   
-   /* 
+   TR_IPBytecodeHashTableEntry *profilingSampleRI (uintptrj_t pc, uintptrj_t data, bool addIt, uint32_t freq);
+
+   /*
    leave the TR_ResolvedMethodSymbol argument for debugging purpose when called from Ilgen
    */
-   void persistIprofileInfo(TR::ResolvedMethodSymbol *methodSymbol, TR_ResolvedMethod *method, TR::Compilation *comp);
+   virtual void persistIprofileInfo(TR::ResolvedMethodSymbol *methodSymbol, TR_ResolvedMethod *method, TR::Compilation *comp); // JITServer: mark virtual
+   bool elgibleForPersistIprofileInfo(TR::Compilation *comp) const;
 
    void checkMethodHashTable();
 
-   int32_t getMaxCallCount();
+   virtual int32_t getMaxCallCount();
 
    //j9method.cpp
    void getFaninInfo(TR_OpaqueMethodBlock *calleeMethod, uint32_t *count, uint32_t *weight, uint32_t *otherBucketWeight = NULL);
@@ -515,7 +544,7 @@ public:
    int32_t getCallCount(TR_OpaqueMethodBlock *calleeMethod, TR_OpaqueMethodBlock *method, int32_t bcIndex, TR::Compilation *);
    int32_t getCallCount(TR_OpaqueMethodBlock *method, int32_t bcIndex, TR::Compilation *);
    int32_t getCallCount(TR_ByteCodeInfo &bcInfo, TR::Compilation *comp);
-   void    setCallCount(TR_OpaqueMethodBlock *method, int32_t bcIndex, int32_t count, TR::Compilation *);
+   virtual void setCallCount(TR_OpaqueMethodBlock *method, int32_t bcIndex, int32_t count, TR::Compilation *);
    void    setCallCount(TR_ByteCodeInfo &bcInfo, int32_t count, TR::Compilation *comp);
 
    int32_t getCGEdgeWeight (TR::Node *callerNode, TR_OpaqueMethodBlock *callee, TR::Compilation *comp);
@@ -556,6 +585,29 @@ public:
    bool postIprofilingBufferToWorkingQueue(J9VMThread * vmThread, const U_8* dataStart, UDATA size);
    // this is wrapper of registered version, for the helper function, from JitRunTime
 
+   // Data accessors, overridden for JITServer
+   //
+
+   // This method is used to search only the hash table
+   virtual TR_IPBytecodeHashTableEntry *profilingSample (uintptrj_t pc, uintptrj_t data, bool addIt, bool isRIData = false, uint32_t freq  = 1);
+   // This method is used to search the hash table first, then the shared cache
+   virtual TR_IPBytecodeHashTableEntry *profilingSample (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex,
+                                                 TR::Compilation *comp, uintptrj_t data = 0xDEADF00D, bool addIt = false);
+   virtual uintptrj_t getProfilingData(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *);
+   virtual uintptrj_t getProfilingData(TR::Node *node, TR::Compilation *comp);
+   uintptrj_t getSearchPC (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *);
+   static uintptrj_t getSearchPCFromMethodAndBCIndex(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex);
+   static uintptrj_t getSearchPCFromMethodAndBCIndex(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation * comp);
+   virtual TR_IPBytecodeHashTableEntry *searchForSample(uintptrj_t pc, int32_t bucket);
+   virtual TR_IPMethodHashTableEntry *searchForMethodSample(TR_OpaqueMethodBlock *omb, int32_t bucket);
+
+protected:
+   bool isCompact(U_8 byteCode);
+   bool isSwitch(U_8 byteCode);
+   bool isNewOpCode(U_8 byteCode);
+   virtual bool invalidateEntryIfInconsistent(TR_IPBytecodeHashTableEntry *entry);
+   TR::CompilationInfo *getCompInfo() { return _compInfo; }
+
 private:
 #ifdef J9VM_INTERP_PROFILING_BYTECODES
    U_8 *getProfilingBufferCursor(J9VMThread *vmThread) const { return vmThread->profilingBufferCursor; }
@@ -573,7 +625,6 @@ private:
    virtual void setBlockAndEdgeFrequencies( TR::CFG *cfg, TR::Compilation *comp);
    virtual bool hasSameBytecodeInfo(TR_ByteCodeInfo & persistentByteCodeInfo, TR_ByteCodeInfo & currentByteCodeInfo, TR::Compilation *comp);
    virtual void getBranchCounters (TR::Node *node, TR::TreeTop *fallThroughTree, int32_t *taken, int32_t *notTaken, TR::Compilation *comp);
-   int32_t getMaxCount(bool isAOT);
    virtual int32_t getSwitchCountForValue (TR::Node *node, int32_t value, TR::Compilation *comp);
    virtual int32_t getSumSwitchCount (TR::Node *node, TR::Compilation *comp);
    virtual int32_t getFlatSwitchProfileCounts (TR::Node *node, TR::Compilation *comp);
@@ -590,45 +641,28 @@ private:
    static int32_t methodHash(uintptrj_t pc);
 //   static int32_t pcHash(uintptrj_t pc);
 
-   bool isCompact(U_8 byteCode);
-   bool isSwitch(U_8 byteCode);
-   bool isNewOpCode(U_8 byteCode);
-
    bool acquireHashTableWriteLock(bool forceFullLock);
    void releaseHashTableWriteLock();
 
-   TR_IPBytecodeHashTableEntry *searchForSample(uintptrj_t pc, int32_t bucket);
    TR_IPBCDataStorageHeader *searchForPersistentSample(TR_IPBCDataStorageHeader  *root, uintptrj_t pc);
    TR_IPBCDataAllocation *searchForAllocSample(uintptrj_t pc, int32_t bucket);
 
-   // This method is used to search the hash table first, then the shared cache
-   TR_IPBytecodeHashTableEntry *profilingSample (uintptrj_t pc, uintptrj_t data, bool addIt, bool isRIData = false, uint32_t freq  = 1);
-   // This method is used to search only the hash table
-   TR_IPBytecodeHashTableEntry *profilingSample (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex,
-                                                 TR::Compilation *comp, uintptrj_t data = 0xDEADF00D, bool addIt = false);
-   TR_IPBytecodeHashTableEntry *profilingSample1 (uintptrj_t pc, uintptrj_t data, bool addIt = false);
    TR_IPBytecodeHashTableEntry * persistentProfilingSample (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *comp, bool *methodProfileExistsInSCC);
-   TR_IPBCDataStorageHeader * persistentProfilingSample (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *comp, bool *methodProfileExistsInSCC, uintptrj_t *cacheOffset, TR_IPBCDataStorageHeader *store);
+   TR_IPBCDataStorageHeader * persistentProfilingSample (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *comp, bool *methodProfileExistsInSCC, TR_IPBCDataStorageHeader *store);
 
    TR_IPBCDataAllocation *profilingAllocSample (uintptrj_t pc, uintptrj_t data, bool addIt);
    TR_IPBytecodeHashTableEntry *findOrCreateEntry (int32_t bucket, uintptrj_t pc, bool addIt);
    TR_IPBCDataAllocation *findOrCreateAllocEntry (int32_t bucket, uintptrj_t pc, bool addIt);
-   uintptrj_t getProfilingData(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *);
-   uintptrj_t getProfilingData(TR::Node *node, TR::Compilation *comp);
    TR_OpaqueMethodBlock * getMethodFromNode(TR::Node *node, TR::Compilation *comp);
-   uintptrj_t getSearchPC (TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *);
    bool addSampleData(TR_IPBytecodeHashTableEntry *entry, uintptrj_t data, bool isRIData = false, uint32_t freq = 1);
    TR_AbstractInfo *createIProfilingValueInfo( TR::Node *node, TR::Compilation *comp);
 
-   TR_IPMethodHashTableEntry *searchForMethodSample(TR_OpaqueMethodBlock *omb, int32_t bucket);
 
    bool branchHasSameDirection(TR::ILOpCodes nodeOpCode, TR::Node *node, TR::Compilation *comp);
    bool branchHasOppositeDirection(TR::ILOpCodes nodeOpCode, TR::Node *node, TR::Compilation *comp);
    uint8_t getBytecodeOpCode(TR::Node *node, TR::Compilation *comp);
-   bool invalidateEntryIfInconsistent(TR_IPBytecodeHashTableEntry *entry);
    bool isNewOpCode(uintptrj_t pc);
    bool isSwitch(uintptrj_t pc);
-   J9Class *getInterfaceClass(J9Method *aMethod, TR::Compilation *comp);
    int32_t getOrSetSwitchData(TR_IPBCDataEightWords *entry, uint32_t data, bool isSet, bool isLookup);
    TR_IPBytecodeHashTableEntry *getProfilingEntry(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *);
 
@@ -636,9 +670,9 @@ private:
    TR_IPBCDataCallGraph* getCGProfilingData(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR::Compilation *comp);
 
    uintptrj_t createBalancedBST(uintptrj_t *pcEntries, int32_t low, int32_t high, uintptrj_t memChunk,
-                                TR::Compilation *comp, uintptrj_t cacheStartAddress, uintptrj_t cacheSize);
+                                TR::Compilation *comp);
    uint32_t walkILTreeForEntries(uintptrj_t *pcEntries, uint32_t &numEntries, TR_J9ByteCodeIterator *bcIterator, TR_OpaqueMethodBlock *method, TR::Compilation *comp,
-                                 uintptrj_t cacheOffset, uintptrj_t cacheSize, vcount_t visitCount, int32_t callerIndex, TR_BitVector *BCvisit, bool &abort);
+                                 vcount_t visitCount, int32_t callerIndex, TR_BitVector *BCvisit, bool &abort);
 
 
    // data members
@@ -653,15 +687,14 @@ private:
    TR_OpaqueMethodBlock           *_valueProfileMethod;
 
    // bytecode hashtable
+   protected:
    TR_IPBytecodeHashTableEntry   **_bcHashTable;
-
+   private:
 #if defined(EXPERIMENTAL_IPROFILER)
    // bytecode hashtable
    TR_IPBCDataAllocation         **_allocHashTable;
 #endif
 
-   // block frequency
-   int32_t                         _maxCount;
    // giving out profiling information for inlined calls
    bool                            _allowedToGiveInlinedInformation;
    int32_t                         _classLoadTimeStampGap;

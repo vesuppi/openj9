@@ -53,10 +53,13 @@ public class JniArgTests {
 	final boolean test_jboolean[] = {true, false};
 	
 	public static void main(String[] args) {
-		System.loadLibrary( "jniargtests" );
+		System.loadLibrary(args[0]);
 		JniArgTests jniArgTests = new JniArgTests();
 		jniArgTests.testBlock();
-		jniArgTests.summary();
+		jniArgTests.testBlock();
+		jniArgTests.testBlock();
+		int rc = jniArgTests.summary();
+		System.exit(rc);
 	}
 
 	void testBlock() {
@@ -2803,8 +2806,7 @@ public class JniArgTests {
 
 	native void logRetValError(String arg);
 
- native void summary();
-
+ 	native int summary();
 
 	native byte nativeBBrB(byte arg1, byte arg2 );
 

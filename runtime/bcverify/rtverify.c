@@ -56,87 +56,92 @@ static void storeMethodInfo (J9BytecodeVerificationData * verifyData, J9UTF8* er
 J9Class *
 j9rtv_verifierGetRAMClass( J9BytecodeVerificationData *verifyData, J9ClassLoader* classLoader, U_8 *className, UDATA nameLength, IDATA *reasonCode)
 {
-	J9Class *found;
+	J9Class *found = NULL;
 	JavaVM* jniVM = (JavaVM*)verifyData->javaVM;
-    J9ThreadEnv* threadEnv;
+	J9ThreadEnv* threadEnv = NULL;
+	J9JavaVM *vm = verifyData->vmStruct->javaVM;
 	(*jniVM)->GetEnv(jniVM, (void**)&threadEnv, J9THREAD_VERSION_1_1);
 
-
 #ifdef J9VM_THR_PREEMPTIVE
-	threadEnv->monitor_enter(verifyData->vmStruct->javaVM->classTableMutex);
+	threadEnv->monitor_enter(vm->classTableMutex);
 #endif
 
 	/* Sniff the class table to see if already loaded */
 	Trc_RTV_j9rtv_verifierGetRAMClass_Entry(verifyData->vmStruct, classLoader, nameLength, className);
-	found = verifyData->vmStruct->javaVM->internalVMFunctions->hashClassTableAt (classLoader, className, nameLength);
+	found = vm->internalVMFunctions->hashClassTableAt (classLoader, className, nameLength);
 
 #ifdef J9VM_THR_PREEMPTIVE
-	threadEnv->monitor_exit(verifyData->vmStruct->javaVM->classTableMutex);
+	threadEnv->monitor_exit(vm->classTableMutex);
 #endif
 
 	if (!found) {
-		J9BytecodeVerificationData savedVerifyData;
-		UDATA *currentAlloc;
-		UDATA *internalBufferStart;
-		UDATA *internalBufferEnd;
-		J9VMThread *tmpVMC = verifyData->vmStruct;
-
-		Trc_RTV_j9rtv_verifierGetRAMClass_notFound(verifyData->vmStruct);
-
-		/* Nest class loading */
-		memcpy(&savedVerifyData, verifyData, sizeof(savedVerifyData));
-		verifyData->vmStruct = NULL;
-
-		if (BCV_ERR_INSUFFICIENT_MEMORY == allocateVerifyBuffers (tmpVMC->javaVM->portLibrary, verifyData)) {
-			/* returning BCV_ERR_INSUFFICIENT_MEMORY for OOM condition */
-			Trc_RTV_j9rtv_verifierGetRAMClass_OutOfMemoryException(verifyData->vmStruct, classLoader, nameLength, className);
-			*reasonCode = BCV_ERR_INSUFFICIENT_MEMORY;
+		/* Set reasonCode to BCV_ERR_CLASS_RELATIONSHIP_RECORD_REQUIRED if -XX:+ClassRelationshipVerifier is used, the class is not already loaded and if the classfile major version is at least 51 (Java 7) */
+		if (J9_ARE_ANY_BITS_SET(vm->extendedRuntimeFlags2, J9_EXTENDED_RUNTIME2_ENABLE_CLASS_RELATIONSHIP_VERIFIER) && (verifyData->romClass->majorVersion >= 51)) {
+			*reasonCode = BCV_ERR_CLASS_RELATIONSHIP_RECORD_REQUIRED;
 			return NULL;
-		}
+		} else {
+			J9BytecodeVerificationData savedVerifyData;
+			UDATA *currentAlloc;
+			UDATA *internalBufferStart;
+			UDATA *internalBufferEnd;
+			J9VMThread *tmpVMC = verifyData->vmStruct;
+
+			Trc_RTV_j9rtv_verifierGetRAMClass_notFound(verifyData->vmStruct);
+
+			/* Nest class loading */
+			memcpy(&savedVerifyData, verifyData, sizeof(savedVerifyData));
+			verifyData->vmStruct = NULL;
+
+			if (BCV_ERR_INSUFFICIENT_MEMORY == allocateVerifyBuffers (tmpVMC->javaVM->portLibrary, verifyData)) {
+				/* returning BCV_ERR_INSUFFICIENT_MEMORY for OOM condition */
+				Trc_RTV_j9rtv_verifierGetRAMClass_OutOfMemoryException(verifyData->vmStruct, classLoader, nameLength, className);
+				*reasonCode = BCV_ERR_INSUFFICIENT_MEMORY;
+				return NULL;
+			}
 
 #ifdef J9VM_THR_PREEMPTIVE
-		threadEnv->monitor_exit(verifyData->verifierMutex);
+			threadEnv->monitor_exit(verifyData->verifierMutex);
 #endif
 
-		/* Find the requested class, fully loading it, but not initializing it. */
+			/* Find the requested class, fully loading it, but not initializing it. */
 
-		found = tmpVMC->javaVM->internalVMFunctions->internalFindClassUTF8(
-			tmpVMC,
-			className,
-			nameLength,
-			classLoader,
-			J9_FINDCLASS_FLAG_THROW_ON_FAIL);
+			found = tmpVMC->javaVM->internalVMFunctions->internalFindClassUTF8(
+				tmpVMC,
+				className,
+				nameLength,
+				classLoader,
+				J9_FINDCLASS_FLAG_THROW_ON_FAIL);
 
-		if (NULL == found) {
-			*reasonCode = BCV_ERR_INACCESSIBLE_CLASS;
-		}
+			if (NULL == found) {
+				*reasonCode = BCV_ERR_INACCESSIBLE_CLASS;
+			}
 
 #ifdef J9VM_THR_PREEMPTIVE
-		/*
-		 * Note: if locking both verifierMutex and classTableMutex, they must be entered in that order (CMVC 186043).
-		 */
+			/*
+			 * Note: if locking both verifierMutex and classTableMutex, they must be entered in that order (CMVC 186043).
+			 */
 
-		threadEnv->monitor_enter(verifyData->verifierMutex);
+			threadEnv->monitor_enter(verifyData->verifierMutex);
 #endif
 
-		freeVerifyBuffers (tmpVMC->javaVM->portLibrary, verifyData);
+			freeVerifyBuffers (tmpVMC->javaVM->portLibrary, verifyData);
 
-		/* The currentAlloc, internalBufferStart, internalBufferEnd fields are NOT nested */
-		/* used in bcvalloc/bcvfree - avoid hammering it */
-		/* This should probably be moved out of the struct, but where? - split the struct by scope */
-		currentAlloc = verifyData->currentAlloc;
-		internalBufferStart = verifyData->internalBufferStart;
-		internalBufferEnd = verifyData->internalBufferEnd;
+			/* The currentAlloc, internalBufferStart, internalBufferEnd fields are NOT nested */
+			/* used in bcvalloc/bcvfree - avoid hammering it */
+			/* This should probably be moved out of the struct, but where? - split the struct by scope */
+			currentAlloc = verifyData->currentAlloc;
+			internalBufferStart = verifyData->internalBufferStart;
+			internalBufferEnd = verifyData->internalBufferEnd;
 
-		memcpy(verifyData, &savedVerifyData, sizeof(savedVerifyData));
+			memcpy(verifyData, &savedVerifyData, sizeof(savedVerifyData));
 
-		verifyData->currentAlloc = currentAlloc;
-		verifyData->internalBufferStart = internalBufferStart;
-		verifyData->internalBufferEnd = internalBufferEnd;
+			verifyData->currentAlloc = currentAlloc;
+			verifyData->internalBufferStart = internalBufferStart;
+			verifyData->internalBufferEnd = internalBufferEnd;
+		} 
 	} else {
 		Trc_RTV_j9rtv_verifierGetRAMClass_found(verifyData->vmStruct);
 	}
-
 
 	Trc_RTV_j9rtv_verifierGetRAMClass_Exit(verifyData->vmStruct);
 
@@ -240,10 +245,10 @@ findAndMatchStack (J9BytecodeVerificationData *verifyData, IDATA targetPC, IDATA
 		Trc_RTV_findAndMatchStack_StackNotFound(verifyData->vmStruct, 
 				(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 				J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-				J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-				J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+				J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+				J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 				targetPC);
 		rc = BCV_FAIL;
 		verifyData->errorDetailCode = BCV_ERR_EXPECT_STACKMAP_FRAME;
@@ -286,10 +291,10 @@ matchStack(J9BytecodeVerificationData * verifyData, J9BranchTargetStack *liveSta
 		Trc_RTV_matchStack_DepthMismatchException(verifyData->vmStruct,
 				(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 				J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-				J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-				J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+				J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+				J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 				size, targetStack->stackTopIndex);
 		rc = BCV_FAIL; /* fail - stack depth mismatch */
 		verifyData->errorDetailCode = BCV_ERR_STACK_SIZE_MISMATCH;
@@ -329,20 +334,20 @@ matchStack(J9BytecodeVerificationData * verifyData, J9BranchTargetStack *liveSta
 						Trc_RTV_matchStack_OutOfMemoryException(verifyData->vmStruct,
 							(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 							J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)));
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)));
 						rc = BCV_ERR_INSUFFICIENT_MEMORY;
 						goto _finished;
 					} else {
 						Trc_RTV_matchStack_IncompatibleClassException(verifyData->vmStruct,
 								(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 								J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-								J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-								J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+								J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+								J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 								(livePtr - liveStack->stackElements), *livePtr, *targetPtr);
 						rc = BCV_FAIL; /* fail - object type mismatch*/
 						goto _incompatibleType;
@@ -352,10 +357,10 @@ matchStack(J9BytecodeVerificationData * verifyData, J9BranchTargetStack *liveSta
 				Trc_RTV_matchStack_PrimitiveMismatchException(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 						(livePtr - liveStack->stackElements), *livePtr, *targetPtr);
 				rc = BCV_FAIL; /* fail - primitive or special mismatch */
 				goto _incompatibleType;
@@ -469,10 +474,10 @@ verifyBytecodes (J9BytecodeVerificationData * verifyData)
 	BOOLEAN isNextStack = FALSE;
 
 	Trc_RTV_verifyBytecodes_Entry(verifyData->vmStruct, 
-			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-			J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-			J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)));
+			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+			J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+			J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)));
 
 	pc = 0;
 
@@ -1152,7 +1157,7 @@ _inconsistentStack2:
 			break;
 
 		case RTV_RETURN:
-			utf8string = J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod);
+			utf8string = J9ROMMETHOD_SIGNATURE(romMethod);
 			temp = &J9UTF8_DATA(utf8string)[J9UTF8_LENGTH(utf8string) - 2];
 			returnChar = (UDATA) temp[1];
 			if (temp[0] != ')') {
@@ -1221,10 +1226,10 @@ _illegalPrimitiveReturn:
 							Trc_RTV_j9rtv_verifyBytecodes_Unreachable(verifyData->vmStruct,
 								(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 								J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-								J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-								J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+								J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+								(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+								J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 								__LINE__);
 							break;
 						}
@@ -2402,19 +2407,19 @@ _verifyError:
 
 	Trc_RTV_verifyBytecodes_VerifyError(verifyData->vmStruct,
 		errorType, 
-		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-		J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-		J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
+		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+		J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+		J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)),
 		start);
 
 	Trc_RTV_verifyBytecodes_VerifyErrorBytecode(verifyData->vmStruct, 
 		(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 		J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-		J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-		J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
+		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+		J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+		J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)),
 		errorType, start, start, *(code + start));
 	BUILD_VERIFY_ERROR(errorModule, errorType);
 
@@ -2429,10 +2434,10 @@ _outOfMemoryError:
 	errorType = J9NLS_BCV_ERR_VERIFY_OUT_OF_MEMORY__ID;
 	Trc_RTV_verifyBytecodes_OutOfMemoryException(verifyData->vmStruct,
 		errorType,
-		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-		J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-		J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
+		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+		J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+		(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+		J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)),
 		start);
 	BUILD_VERIFY_ERROR(errorModule, errorType);
 	return BCV_ERR_INSUFFICIENT_MEMORY;
@@ -2458,10 +2463,10 @@ verifyExceptions (J9BytecodeVerificationData *verifyData)
 	IDATA reasonCode = 0;
 
 	Trc_RTV_verifyExceptions_Entry(verifyData->vmStruct, 
-			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-			J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-			J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)));
+			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+			J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+			J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)));
 	
 	/* Verify catch types are throwable */
 	exceptionInfo = J9_EXCEPTION_DATA_FROM_ROM_METHOD(romMethod);
@@ -2480,20 +2485,20 @@ verifyExceptions (J9BytecodeVerificationData *verifyData)
 					Trc_RTV_verifyExceptions_OutOfMemoryException(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)));
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)));
 					rc = BCV_ERR_INSUFFICIENT_MEMORY;
 					break;
 				} else {
 					Trc_RTV_verifyExceptions_VerifyError(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(romClass, romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(romClass, romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(romMethod)),
 						i, J9UTF8_LENGTH(catchName), J9UTF8_DATA(catchName));
 					rc = BCV_FAIL;
 					break;
@@ -2584,10 +2589,10 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 					Trc_RTV_j9rtv_verifyArguments_Unreachable(verifyData->vmStruct, 
 							(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 							J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 							__LINE__);
 					mrc = BCV_FAIL;
 					break;
@@ -2601,10 +2606,10 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 					Trc_RTV_j9rtv_verifyArguments_Unreachable(verifyData->vmStruct, 
 							(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 							J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 							__LINE__);
 					mrc = BCV_FAIL;
 					break;
@@ -2623,30 +2628,30 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 					Trc_RTV_j9rtv_verifyArguments_OutOfMemoryException(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)));
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)));
 					mrc = BCV_ERR_INSUFFICIENT_MEMORY;
 					break;
 				} else if (BCV_ERR_INACCESSIBLE_CLASS == reasonCode) {
 					Trc_RTV_j9rtv_verifyArguments_InaccessibleClass(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)));
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)));
 					mrc = BCV_ERR_INACCESSIBLE_CLASS;
 					break;
 				} else {
 					Trc_RTV_j9rtv_verifyArguments_ObjectMismatch(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 						index, J9UTF8_LENGTH(utf8string), J9UTF8_DATA(utf8string), stackTop[index]);
 					mrc = BCV_FAIL;
 					verifyData->errorDetailCode = BCV_ERR_INCOMPATIBLE_TYPE; /* failure - object type mismatch */
@@ -2663,10 +2668,10 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 				Trc_RTV_j9rtv_verifyArguments_Unreachable(verifyData->vmStruct,
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 						__LINE__);
 				mrc = BCV_FAIL;
 				break;
@@ -2689,10 +2694,10 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 				Trc_RTV_j9rtv_verifyArguments_Unreachable(verifyData->vmStruct, 
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 						__LINE__);
 				mrc = BCV_FAIL;
 				break;
@@ -2702,10 +2707,10 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 				Trc_RTV_j9rtv_verifyArguments_PrimitiveMismatch(verifyData->vmStruct, 
 						(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 						J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-						J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+						(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+						J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 						index, J9UTF8_LENGTH(utf8string), J9UTF8_DATA(utf8string), stackTop[index]);
 				mrc = BCV_FAIL;
 				verifyData->errorDetailCode = BCV_ERR_INCOMPATIBLE_TYPE; /* failure - primitive mismatch */
@@ -2719,10 +2724,10 @@ j9rtv_verifyArguments (J9BytecodeVerificationData *verifyData, J9UTF8 * utf8stri
 					Trc_RTV_j9rtv_verifyArguments_WidePrimitiveMismatch(verifyData->vmStruct, 
 							(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 							J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-							J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+							(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+							J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 							index, J9UTF8_LENGTH(utf8string), J9UTF8_DATA(utf8string));
 					mrc = BCV_FAIL;
 					verifyData->errorDetailCode = BCV_ERR_INCOMPATIBLE_TYPE; /* failure - wide primitive mismatch */
@@ -2770,10 +2775,10 @@ nextStack (J9BytecodeVerificationData *verifyData, UDATA *nextMapIndex, IDATA *n
 	Trc_RTV_nextStack_Result(verifyData->vmStruct, 
 			(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 			J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-			J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-			J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+			J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+			(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+			J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 			verifyData->stackMapsCount, *nextMapIndex, *nextStackPC, 
 			J9_BYTECODE_SIZE_FROM_ROM_METHOD(verifyData->romMethod));
 	return returnStack;
@@ -2802,10 +2807,10 @@ nextExceptionStart (J9BytecodeVerificationData *verifyData, J9ROMMethod *romMeth
 		Trc_RTV_nextExceptionStart_Result(verifyData->vmStruct, 
 				(UDATA) J9UTF8_LENGTH(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
 				J9UTF8_DATA(J9ROMCLASS_CLASSNAME(verifyData->romClass)),
-				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-				J9UTF8_DATA(J9ROMMETHOD_GET_NAME(verifyData->romClass, verifyData->romMethod)),
-				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
-				J9UTF8_DATA(J9ROMMETHOD_GET_SIGNATURE(verifyData->romClass, verifyData->romMethod)),
+				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_NAME(verifyData->romMethod)),
+				J9UTF8_DATA(J9ROMMETHOD_NAME(verifyData->romMethod)),
+				(UDATA) J9UTF8_LENGTH(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
+				J9UTF8_DATA(J9ROMMETHOD_SIGNATURE(verifyData->romMethod)),
 				exceptionInfo->catchCount, lastPC, nextPC, 
 				J9_BYTECODE_SIZE_FROM_ROM_METHOD(romMethod));
 	}

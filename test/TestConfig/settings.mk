@@ -55,26 +55,6 @@ include $(TEST_ROOT)$(D)TestConfig$(D)utils.mk
 include $(TEST_ROOT)$(D)TestConfig$(D)testEnv.mk
 include $(TEST_ROOT)$(D)TestConfig$(D)featureSettings.mk
 
-# temporarily support both JAVA_VERSION and JDK_VERSION
-ifeq ($(JAVA_VERSION), SE80)
-	JDK_VERSION:=8
-endif
-ifeq ($(JAVA_VERSION), SE90)
-	JDK_VERSION:=9
-endif
-ifeq ($(JAVA_VERSION), SE100)
-	JDK_VERSION:=10
-endif
-ifeq ($(JAVA_VERSION), SE110)
-	JDK_VERSION:=11
-endif
-ifeq ($(JAVA_VERSION), SE120)
-	JDK_VERSION:=12
-endif
-ifeq ($(JAVA_VERSION), SE130)
-	JDK_VERSION:=13
-endif
-
 ifndef JDK_VERSION
 	export JDK_VERSION:=8
 else
@@ -85,12 +65,6 @@ ifndef TEST_JDK_HOME
 $(error Please provide TEST_JDK_HOME value.)
 else
 export TEST_JDK_HOME := $(subst \,/,$(TEST_JDK_HOME))
-endif
-
-ifeq ($(JDK_VERSION), 8)
-export JAVA_BIN := $(TEST_JDK_HOME)/jre/bin
-else
-export JAVA_BIN := $(TEST_JDK_HOME)/bin
 endif
 
 OLD_JAVA_HOME := $(JAVA_HOME)
@@ -305,7 +279,6 @@ setup_%: testEnvSetup
 		$(ECHO) JAVA_HOME was originally set to $(OLD_JAVA_HOME); \
 	fi
 	@$(ECHO) set JAVA_HOME to $(JAVA_HOME)
-	@$(ECHO) set JAVA_BIN to $(JAVA_BIN)
 	@$(ECHO) set SPEC to $(SPEC)
 	@$(MKTREE) $(Q)$(TESTOUTPUT)$(Q)
 	@$(ECHO) Running $(TESTTARGET) ...
@@ -348,4 +321,4 @@ rmResultFile:
 	@$(RM) $(Q)$(TEMPRESULTFILE)$(Q)
 
 resultsSummary:
-	@perl $(Q)$(TEST_ROOT)$(D)TestConfig$(D)scripts$(D)testKitGen$(D)resultsSummary$(D)resultsSum.pl$(Q) --failuremk=$(Q)$(FAILEDTARGETS)$(Q) --resultFile=$(Q)$(TEMPRESULTFILE)$(Q) --tapFile=$(Q)$(TAPRESULTFILE)$(Q) --diagnostic=$(DIAGNOSTICLEVEL)
+	@perl $(Q)$(TEST_ROOT)$(D)TestConfig$(D)scripts$(D)testKitGen$(D)resultsSummary$(D)resultsSum.pl$(Q) --failuremk=$(Q)$(FAILEDTARGETS)$(Q) --resultFile=$(Q)$(TEMPRESULTFILE)$(Q) --tapFile=$(Q)$(TAPRESULTFILE)$(Q) --diagnostic=$(DIAGNOSTICLEVEL) --jdkVersion=$(JDK_VERSION) --jdkImpl=$(JDK_IMPL) --spec=$(SPEC) --buildList=$(BUILD_LIST) --customTarget=$(CUSTOM_TARGET)

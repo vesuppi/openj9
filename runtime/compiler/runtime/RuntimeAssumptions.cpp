@@ -32,6 +32,7 @@
 #include "infra/Monitor.hpp"
 #include "infra/CriticalSection.hpp"
 #include "control/CompilationRuntime.hpp"
+#include "control/CompilationThread.hpp"
 #include "env/VMJ9.h"
 
 namespace TR { class Monitor; }
@@ -50,15 +51,6 @@ TR_PatchNOPedGuardSiteOnClassPreInitialize::make(
    result->addToRAT(persistentMemory, RuntimeAssumptionOnClassPreInitialize, fe, sentinel);
    return result;
    }
-
-
-void
-TR_PatchNOPedGuardSiteOnClassPreInitialize::compensate(TR_FrontEnd *fe, bool isSMP, void *data)
-   {
-   reclaim();
-   TR::PatchNOPedGuardSite::compensate(fe, isSMP, data);
-   }
-
 
 uintptrj_t
 TR_PatchNOPedGuardSiteOnClassPreInitialize::hashCode(char *sig, uint32_t sigLen)
@@ -90,20 +82,33 @@ TR_PatchNOPedGuardSiteOnClassPreInitialize::hashCode(char *sig, uint32_t sigLen)
    return sum;
    }
 
+void
+TR_PatchNOPedGuardSiteOnClassPreInitialize::reclaim()
+   {
+   TR_ASSERT_FATAL(_key != NULL, "Attempt to reclaim an already freed _key");
+
+   jitPersistentFree((void*)_key);
+   _key = 0;
+   }
 
 bool
 TR_PatchNOPedGuardSiteOnClassPreInitialize::matches(char *sig, uint32_t sigLen)
    {
-   if (sigLen+2 != _sigLen) return false;
+   if (sigLen + 2 != _sigLen)
+      {
+      return false;
+      }
+
    char *mySig = (char*)getKey();
-   uint32_t compareIndex = sigLen-1;
-   for ( ; sigLen > 0; sigLen--)
+
+   for (uint32_t compareIndex = sigLen - 1; sigLen > 0; sigLen--)
       {
       if (mySig[compareIndex+1] != sig[compareIndex])
          return false;
 
       compareIndex--;
       }
+
    return true;
    }
 
@@ -224,6 +229,9 @@ TR_PersistentCHTable::classGotExtended(
    {
    TR_PersistentClassInfo * cl = findClassInfo(superClassId);
    TR_PersistentClassInfo * subClass = findClassInfo(subClassId); // This is actually the class that got loaded extending the superclass
+#if defined(JITSERVER_SUPPORT)
+   TR::CompilationInfo::get()->classGotNewlyExtended(superClassId);
+#endif
    // should have an assume0(cl && subClass) here - but assume does not work rt-code
 
    TR_SubClass *sc = cl->addSubClass(subClass); // Updating the hierarchy
@@ -292,6 +300,7 @@ TR_PersistentCHTable::removeClass(
       jitPersistentFree(subcl);
       subcl = nextScl;
       }
+   info->setFirstSubClass(NULL);
 
    J9Class *clazzPtr;
    J9Class *superCl;
@@ -324,12 +333,9 @@ TR_PersistentCHTable::removeClass(
 
       }
 
-   if (!removeInfo)
-      info->setFirstSubClass(0);
-   else
+   if (removeInfo)
       {
       _classes[hashPos].remove(info);
-      info->removeSubClasses();
       jitPersistentFree(info);
       }
    }
@@ -449,4 +455,21 @@ TR_PersistentCHTable::removeAssumptionFromRAT(OMR::RuntimeAssumption *assumption
    {
    TR_RuntimeAssumptionTable *rat = _trPersistentMemory->getPersistentInfo()->getRuntimeAssumptionTable();
    rat->markForDetachFromRAT(assumption);
+   }
+
+void
+TR_PersistentClassInfo::setShouldNotBeNewlyExtended(int32_t ID)
+   {
+#if defined(JITSERVER_SUPPORT)
+   if (TR::compInfoPT->getStream())
+      {
+      auto classesThatShouldNotBeNewlyExtended = TR::compInfoPT->getClassesThatShouldNotBeNewlyExtended();
+      if (classesThatShouldNotBeNewlyExtended)
+         classesThatShouldNotBeNewlyExtended->insert(_classId);
+      }
+   else
+#endif
+      {
+      _shouldNotBeNewlyExtended.set(1 << ID);
+      }
    }
